@@ -57,6 +57,7 @@ coverage/
 
 # Claude Code session data
 sessions/
+!native/src/features/sessions/
 .claude-sessions/
 .claude-images/
 **/tmp/done-plans/
@@ -122,3 +123,6 @@ docs/research/
 # Draft posts (local only)
 docs/posts/
 .agent-farm/generated/
+
+# Generated from the Excalidraw dependency for offline drawing support
+frontend/public/excalidraw-assets/

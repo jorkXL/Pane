@@ -20,8 +20,10 @@ import {
   terminalClaimsFineSurfaceScroll,
 } from '../../utils/terminalKeyHandling';
 import { isMac } from '../../utils/platformUtils';
-import { copyTerminalText, isTerminalCopyShortcut } from '../../utils/terminalClipboard';
+import { copyTerminalText, decodeOsc52Write, isTerminalCopyShortcut } from '../../utils/terminalClipboard';
 import { sendTerminalInput } from '../../utils/terminalInput';
+import { terminalTiming } from '../../utils/terminalTiming';
+import { acknowledgeTerminalOutput } from '../../utils/terminalAck';
 import { FileEdit, FolderOpen } from 'lucide-react';
 import { useTerminalLinks } from '../terminal/hooks/useTerminalLinks';
 import { openPaneLink } from '../terminal/openPaneLink';
@@ -53,6 +55,7 @@ interface DropdownPosition {
 // Hold the loading overlay at least this long past ready so the terminal
 // underneath finishes painting before it is revealed.
 const TERMINAL_OVERLAY_LINGER_MS = 150;
+const TERMINAL_LOADING_TIMEOUT_MS = 30_000;
 
 const SKELETON_TRANSCRIPT_WIDTHS = ['w-2/3', 'w-1/2', 'w-5/6', 'w-1/3', 'w-3/4', 'w-2/5'];
 
@@ -251,9 +254,13 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   const webLinksAddonRef = useRef<WebLinksAddon | null>(null);
   const paneLinksAddonRef = useRef<WebLinksAddon | null>(null);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  // Restored output still being parsed. OSC 52 copies in it are history, not new copies.
+  const pendingReplayWritesRef = useRef(0);
   const unicode11AddonRef = useRef<Unicode11Addon | null>(null);
   const imageAddonRef = useRef<ImageAddon | null>(null);
   const isActiveRef = useRef(isActive);
+  const pasteFilesRef = useRef<((files: File[]) => void) | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const isNearBottomRef = useRef(true); // Track if user is scrolled near the bottom
   const [showScrollDown, setShowScrollDown] = useState(false); // Show jump-to-bottom pill
   const tuiActiveRef = useRef(false);
@@ -261,6 +268,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   const [isInitialized, setIsInitialized] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
+  const [initAttempt, setInitAttempt] = useState(0);
   const [interceptorState, setInterceptorState] = useState<InterceptorState | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [windowFocused, setWindowFocused] = useState(true);
@@ -367,6 +375,16 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   // active, hide only after a short linger so the terminal underneath has
   // finished painting before the mask lifts.
   const overlayActive = !isInitialized || isRefreshing || (isCliPanel && !isCliReady);
+  useEffect(() => {
+    if (!overlayActive) {
+      setInitError(null);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      setInitError('Terminal loading timed out. Check the host connection and retry.');
+    }, TERMINAL_LOADING_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [overlayActive, initAttempt]);
   const [overlayVisible, setOverlayVisible] = useState(true);
   useEffect(() => {
     if (overlayActive) {
@@ -393,15 +411,16 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
 
   // Listen for the ptyHost ptyId assignment. The main process fires this
   // once per spawn when the `usePtyHost` setting is on; fires again on auto-reattach
-  // after a supervisor restart with a new ptyId.
+  // after a supervisor restart with a new ptyId. A remote host's ptyHost is not
+  // behind this window's port, so remote terminals keep acking over `terminal:ack`.
   useEffect(() => {
     const cleanup = window.electronAPI.events.onTerminalPtyReady((data) => {
       if (data.panelId === panel.id) {
-        currentPtyIdRef.current = data.ptyId;
+        currentPtyIdRef.current = isRemoteMode ? null : data.ptyId;
       }
     });
     return cleanup;
-  }, [panel.id]);
+  }, [panel.id, isRemoteMode]);
 
   // Get session data from context using the safe hook
   const sessionContext = useSession();
@@ -621,6 +640,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
   } = useTerminalLinks(terminalInstance, {
     workingDirectory: workingDirectory || '',
     sessionId: sessionId || panel.sessionId,
+    onCopyError: handleClipboardError,
   });
 
   // Terminal search hook
@@ -776,8 +796,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           ? state.scrollbackBuffer.join('\n')
           : state.scrollbackBuffer;
         if (content) {
+          pendingReplayWritesRef.current += 1;
           await new Promise<void>((resolve, reject) => {
             terminal.write(content, () => {
+              pendingReplayWritesRef.current -= 1;
               void finishRefresh().then(resolve, reject);
             });
           });
@@ -881,6 +903,9 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
       devLog.debug('[TerminalPanel] Missing terminal ref, skipping initialization');
       return;
     }
+    setInitError(null);
+    setIsInitialized(false);
+    needsFullActivationRefreshRef.current = true;
 
     let terminal: Terminal | null = null;
     let fitAddon: FitAddon | null = null;
@@ -898,6 +923,19 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
     const initializeTerminal = async () => {
       try {
         devLog.debug('[TerminalPanel] Starting initialization for panel:', panel.id);
+
+        // A retry can follow a missed one-shot cliReady event. Read the host's
+        // persisted readiness instead of waiting for that event to fire again.
+        if (initAttempt > 0 && isCliPanelRef.current) {
+          const result = await window.electronAPI.panels.getSessionPanels(panel.sessionId);
+          if (disposed) return;
+          if (!result.success) throw new Error(result.error || 'Could not reload terminal state');
+          const current = result.data?.find(candidate => candidate.id === panel.id);
+          const readiness = decodeOptionalBoundary(current?.state.customState, boundary.object({
+            isCliReady: boundary.optional(boundary.boolean),
+          }));
+          if (readiness?.isCliReady) setIsCliReady(true);
+        }
 
         // Check if already initialized on backend
         const initialized = await window.electronAPI.invoke('panels:checkInitialized', panel.id);
@@ -1000,6 +1038,23 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
         fitAddon = new FitAddon();
         terminal.loadAddon(fitAddon);
         devLog.debug('[TerminalPanel] FitAddon loaded');
+
+        // OSC 52 lets programs in the terminal (Claude Code, tmux, vim over ssh) copy
+        // text. This renderer runs on the machine the user is at, so the text lands on
+        // that clipboard even when the program runs on a remote host.
+        // A disposed terminal never runs its replay callbacks, so start the count fresh.
+        pendingReplayWritesRef.current = 0;
+        terminal.parser.registerOscHandler(52, (data) => {
+          const text = decodeOsc52Write(data);
+          // Only while the user is in this window: output arriving in the background
+          // cannot silently replace what they copied elsewhere.
+          if (text && pendingReplayWritesRef.current === 0 && document.hasFocus()) {
+            void copyTerminalText(text).catch(() => {
+              terminalRuntimeRef.current.handleClipboardError();
+            });
+          }
+          return true;
+        });
 
         // Intercept app-level shortcuts before xterm consumes them
         terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -1160,13 +1215,23 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
         if (terminalRef.current && !disposed) {
           devLog.debug('[TerminalPanel] Opening terminal in DOM element:', terminalRef.current);
           terminal.open(terminalRef.current);
+          // Teardown must own this renderer even if a font/addon request never
+          // settles; Retry reuses the container while abandoning this attempt.
+          xtermRef.current = terminal;
+          fitAddonRef.current = fitAddon;
           devLog.debug('[TerminalPanel] Terminal opened in DOM');
+          // xterm takes keys from here on, but the input handler is attached
+          // only after the awaits below. Hold early keys for it instead of
+          // emitting them to no listener.
+          const earlyInput: string[] = [];
+          const earlyInputDisposable = terminal.onData(data => earlyInput.push(data));
 
           // Wait for fonts to load before fitting so xterm measures correct cell dimensions
           await Promise.all([
             document.fonts.load(`${terminalFontSize}px "${terminalFontFamily}"`).catch(() => {}),
             document.fonts.load(`${terminalFontSize}px "Symbols Nerd Font Mono"`).catch(() => {}),
           ]);
+          if (disposed) return;
           // Never fit against a hidden/mid-layout container (display:none keep-alive
           // tabs measure 0×0): FitAddon resizes the grid with no floor, and background
           // PTY output then parses into a garbage-width buffer that reflow can't fix.
@@ -1253,13 +1318,9 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           }
 
           if (disposed) {
-            terminal.dispose();
-            fitAddon.dispose();
             return;
           }
-          xtermRef.current = terminal;
           setTerminalInstance(terminal);
-          fitAddonRef.current = fitAddon;
 
           // Track scroll position with direction-based sticky behaviour.
           // Also snap to true bottom when the user scrolls close enough — xterm's mouse
@@ -1302,6 +1363,12 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           const ACK_BATCH_INTERVAL = 100; // ms
           let pendingAckBytes = 0;
           let ackFlushTimer: ReturnType<typeof setTimeout> | null = null;
+          let pendingRenderStarted: number | undefined;
+          const timingRenderDisposable = terminalTiming ? terminal.onRender(() => {
+            if (pendingRenderStarted === undefined) return;
+            terminalTiming?.record('outputRender', performance.now() - pendingRenderStarted);
+            pendingRenderStarted = undefined;
+          }) : undefined;
 
           const flushAck = () => {
             if (ackFlushTimer) {
@@ -1311,16 +1378,11 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             if (pendingAckBytes > 0) {
               const bytes = pendingAckBytes;
               pendingAckBytes = 0;
-              // Under the ptyHost flag, ack over the per-window MessagePort so it
-              // bypasses the main IPC invoke queue. Flag-off keeps the legacy
-              // IPC path. `currentPtyIdRef` is a ref because the ptyId can change
-              // across auto-reattach after a supervisor restart.
-              const activePtyId = currentPtyIdRef.current;
-              if (activePtyId) {
-                window.electronAPI.ptyHost.ack(activePtyId, bytes);
-              } else {
-                window.electronAPI.invoke('terminal:ack', panel.id, bytes);
-              }
+              // Read the current mode at flush time, including when a local
+              // ptyId survived a switch to a remote host.
+              acknowledgeTerminalOutput(
+                panel.id, bytes, currentPtyIdRef.current, terminalRuntimeRef.current.isRemoteMode,
+              );
             }
           };
 
@@ -1336,7 +1398,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             const restore = selectTerminalRestoreContent(terminalStateForThisPanel);
             if (restore) {
               devLog.debug('[TerminalPanel] Restoring', restore.content.length, 'chars from', restore.source);
-              terminal.write(restore.content);
+              pendingReplayWritesRef.current += 1;
+              terminal.write(restore.content, () => {
+                pendingReplayWritesRef.current -= 1;
+              });
             }
             // Force WebGL renderer to redraw after buffer content changes.
             // Without this, macOS WebGL canvas shows stale/stuttered content until
@@ -1488,18 +1553,16 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             e.preventDefault();
             e.dataTransfer.dropEffect = 'copy';
           };
-          const handleDrop = (e: DragEvent) => {
-            e.preventDefault();
-            if (!e.dataTransfer?.files.length || disposed || !terminal) return;
-
-            // Save all dropped files to disk and paste the resolved path
-            const files = Array.from(e.dataTransfer.files);
+          // Save files on the terminal's host and paste each resolved path. Shared by
+          // drag-and-drop and the upload button's file picker.
+          const pasteFiles = (files: File[]) => {
+            if (!files.length || disposed || !terminal) return;
             (async () => {
               for (const file of files) {
                 if (file.size > 50 * 1024 * 1024) {
                   const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
                   if (!disposed && terminal) {
-                    terminal.paste(`[Drop failed] File too large (${sizeMB} MB), max 50 MB\n`);
+                    terminal.paste(`[Upload failed] File too large (${sizeMB} MB), max 50 MB\n`);
                   }
                   continue;
                 }
@@ -1542,16 +1605,21 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
                     terminal.paste(`${resolvedPath}\n`);
                   }
                 } catch (err) {
-                  console.error('[TerminalPanel] Failed to drop file:', err);
+                  console.error('[TerminalPanel] Failed to upload file:', err);
                   if (!disposed && terminal) {
                     // Strip Electron's IPC wrapper so the user sees the backend reason
                     const raw = err instanceof Error ? err.message : String(err);
                     const reason = raw.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, '');
-                    terminal.paste(`[Drop failed] ${reason || 'Unknown error'}\n`);
+                    terminal.paste(`[Upload failed] ${reason || 'Unknown error'}\n`);
                   }
                 }
               }
             })();
+          };
+          pasteFilesRef.current = pasteFiles;
+          const handleDrop = (e: DragEvent) => {
+            e.preventDefault();
+            pasteFiles(Array.from(e.dataTransfer?.files ?? []));
           };
           terminalRef.current.addEventListener('dragover', handleDragOver);
           terminalRef.current.addEventListener('drop', handleDrop);
@@ -1570,19 +1638,30 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           const writeAndAck = (output: string) => {
             if (!terminal || disposed) return;
             const outputLength = output.length;
+            const writeStarted = terminalTiming ? performance.now() : 0;
             terminal.write(output, () => {
               if (disposed) return;
+              if (terminalTiming) {
+                terminalTiming.record('outputParse', performance.now() - writeStarted);
+                pendingRenderStarted ??= writeStarted;
+              }
               markPanelOutput(panel.id);
-              // Ack AFTER xterm has rendered the data — proper backpressure
+              // Ack AFTER xterm has parsed the data — proper backpressure.
               pendingAckBytes += outputLength;
               if (pendingAckBytes >= ACK_BATCH_SIZE) {
                 flushAck();
               } else if (!ackFlushTimer) {
                 ackFlushTimer = setTimeout(flushAck, ACK_BATCH_INTERVAL);
               }
-              // Read scroll position LIVE after render, not before write —
+              // Read scroll position LIVE after parsing, not before write —
               // avoids stale shouldSnap=true yanking user back to bottom
-              if (isNearBottomRef.current && terminal) {
+              // xterm's scrollToBottom refreshes every viewport row even for a
+              // zero-distance scroll. Preserve its dirty-row repaint for CLI
+              // typing echoes that already leave the viewport at the bottom.
+              if (
+                isNearBottomRef.current && terminal
+                && terminal.buffer.active.viewportY !== terminal.buffer.active.baseY
+              ) {
                 terminal.scrollToBottom();
               }
             });
@@ -1750,7 +1829,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
           }));
 
           // Handle terminal input — route through interceptor first
-          const inputDisposable = terminal.onData((data) => {
+          const handleInput = (data: string) => {
             if (data === '\r' && isCliPanelRef.current) startSendPrompt(panel.id);
             // Skip interception for AltGr-produced @ (e.g. German keyboard)
             if (skipNextInterceptRef.current) {
@@ -1762,7 +1841,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             if (!result.consumed) {
               sendTerminalInput(panel.id, data);
             }
-          });
+          };
+          earlyInputDisposable.dispose();
+          earlyInput.forEach(handleInput);
+          const inputDisposable = terminal.onData(handleInput);
 
           // Handle resize — delegates to the guarded resizePtyToFit (single resize path)
           // Debounce so fit() only fires after transitions settle (300ms sidebar animations)
@@ -1798,10 +1880,12 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             unsubscribeExited();
             unsubscribeFontUpdate();
             inputDisposable.dispose();
+            timingRenderDisposable?.dispose();
             scrollDisposable.dispose();
             terminalElement?.removeEventListener('paste', handlePaste, { capture: true });
             terminalElement?.removeEventListener('dragover', handleDragOver);
             terminalElement?.removeEventListener('drop', handleDrop);
+            if (pasteFilesRef.current === pasteFiles) pasteFilesRef.current = null;
           };
         }
       } catch (error) {
@@ -1901,7 +1985,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
       
       setIsInitialized(false);
     };
-  }, [panel.id]); // Only depend on panel.id to prevent re-initialization on session switch
+  }, [panel.id, initAttempt]); // Reinitialize only for a different panel or an explicit retry.
 
   // Shared activation refresh for both power modes: fires on tab activation and
   // window refocus (activationVisible = panelVisible && windowFocused). Initial,
@@ -2002,9 +2086,10 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
             if (!hotActivation) return;
             await waitForNextPaint();
             if (cancelled) return;
-            hideOverlayTimer = setTimeout(() => {
-              if (!cancelled) setIsRefreshing(false);
-            }, TERMINAL_ACTIVATION_MASK_AFTER_PAINT_MS);
+            // The live buffer has now completed both reconciles and the delayed
+            // paint. The overlay's own linger still shields presentation; adding
+            // the full-replay settle timer here only delays an already hot view.
+            setIsRefreshing(false);
           })();
         }, REFOCUS_DELAYED_REFRESH_MS);
 
@@ -2064,14 +2149,6 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
     );
   }
 
-  if (initError) {
-    return (
-      <div className="flex items-center justify-center h-full text-red-500">
-        Terminal initialization failed: {initError}
-      </div>
-    );
-  }
-
   // Always render the terminal div to keep XTerm instance alive
   return (
     <div
@@ -2099,6 +2176,29 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
       {/* Terminal scroll buttons — compact, revealed on hover */}
       {isInitialized && (
         <div className="absolute top-2 right-5 z-30 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover/terminal:opacity-100 group-hover/terminal:pointer-events-auto transition-opacity">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              pasteFilesRef.current?.(Array.from(e.target.files ?? []));
+              e.target.value = '';
+              xtermRef.current?.focus();
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => uploadInputRef.current?.click()}
+            className="p-0.5 rounded bg-surface-secondary/60 hover:bg-surface-tertiary/80 text-text-tertiary hover:text-text-secondary transition-colors"
+            title="Upload files"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 8V2" />
+              <path d="M3.5 4.5L6 2l2.5 2.5" />
+              <path d="M2 8.5v1.5h8V8.5" />
+            </svg>
+          </button>
           <button
             onClick={() => { void handleManualRefresh(); }}
             className="p-0.5 rounded bg-surface-secondary/60 hover:bg-surface-tertiary/80 text-text-tertiary hover:text-text-secondary transition-colors"
@@ -2152,9 +2252,12 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
         </button>
       )}
 
-      {overlayVisible && (
+      {(overlayVisible || initError) && (
         <div className="absolute inset-0 bg-surface-primary z-10" data-testid="terminal-activation-mask">
-          <TerminalLoadingSkeleton />
+          {initError ? <div className="flex h-full flex-col items-center justify-center gap-3 p-4 text-text-secondary">
+            <p role="alert">Terminal could not load: {initError}</p>
+            <button type="button" className="rounded bg-surface-secondary px-3 py-2 text-text-primary" onClick={() => setInitAttempt(attempt => attempt + 1)}>Retry</button>
+          </div> : <TerminalLoadingSkeleton />}
         </div>
       )}
 
@@ -2196,6 +2299,7 @@ const TerminalPanel: React.FC<TerminalPanelProps> = React.memo(({ panel, isActiv
         x={selectionPopover.x}
         y={selectionPopover.y}
         text={selectionPopover.text}
+        panelTitle={panel.title}
         workingDirectory={workingDirectory}
         sessionId={panel.sessionId}
         isRemoteMode={isRemoteMode}

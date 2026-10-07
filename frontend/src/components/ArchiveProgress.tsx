@@ -1,65 +1,95 @@
-import { useState, useEffect, useId } from 'react';
-import type { IpcRendererEvent } from 'electron';
+import { useState, useEffect, useId, useCallback } from 'react';
 import { Loader2, Archive, CheckCircle, AlertCircle } from 'lucide-react';
 import { LiveRegion } from './ui/LiveRegion';
+import type { ArchiveProgressSnapshot, ArchiveProgressTask } from '../../../shared/types/archiveProgress';
 
-interface ArchiveTask {
-  sessionId: string;
-  sessionName: string;
-  worktreeName: string;
-  projectName: string;
-  status: 'pending' | 'queued' | 'removing-worktree' | 'cleaning-artifacts' | 'completed' | 'failed';
-  startTime: string;
-  endTime?: string;
-  error?: string;
+function getStatusIcon(status: ArchiveProgressTask['status']) {
+  switch (status) {
+    case 'completed':
+      return <CheckCircle className="w-3 h-3 text-status-success" />;
+    case 'failed':
+      return <AlertCircle className="w-3 h-3 text-status-error" />;
+    case 'queued':
+      return <Archive className="w-3 h-3 text-status-waiting" />;
+    default:
+      return <Loader2 className="w-3 h-3 text-status-info animate-spin" />;
+  }
 }
 
-interface ArchiveProgressData {
-  tasks: ArchiveTask[];
-  activeCount: number;
-  totalCount: number;
+function getStatusText(status: ArchiveProgressTask['status']) {
+  switch (status) {
+    case 'queued':
+      return 'Queued (waiting for other archives to complete)...';
+    case 'pending':
+      return 'Preparing...';
+    case 'removing-worktree':
+      return 'Removing worktree (this may take a while)...';
+    case 'cleaning-artifacts':
+      return 'Cleaning artifacts...';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    default:
+      return status;
+  }
 }
 
 export function ArchiveProgress() {
   const taskListId = useId();
-  const [progress, setProgress] = useState<ArchiveProgressData | null>(null);
+  const [progress, setProgress] = useState<ArchiveProgressSnapshot | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState<string | null>(null);
+  const hasActiveTasks = (progress?.activeCount ?? 0) > 0;
 
-  useEffect(() => {
-    // Initial load
-    loadProgress();
-
-    // Listen for progress updates
-    const handleProgress = (_event: IpcRendererEvent, data: ArchiveProgressData) => {
-      setProgress(data);
-      // Auto-expand when there are active tasks
-      if (data.activeCount > 0 && !isExpanded) {
-        setIsExpanded(true);
-      }
-    };
-
-    window.electron?.on('archive:progress', handleProgress);
-
-    // Poll for initial state in case we missed events
-    const interval = setInterval(loadProgress, 2000);
-
-    return () => {
-      window.electron?.off('archive:progress', handleProgress);
-      clearInterval(interval);
-    };
-  }, [isExpanded]);
-
-  const loadProgress = async () => {
-    if (!window.electron) return;
+  // Archive jobs run on the active host, so read them through the daemon and reload on a host switch.
+  const loadProgress = useCallback(async () => {
     try {
-      const response = await window.electron.invoke('archive:get-progress');
+      const response = await window.electronAPI.invoke('archive:get-progress');
       if (response.success) {
         setProgress(response.data);
       }
     } catch (error) {
       console.error('Failed to load archive progress:', error);
     }
+  }, []);
+
+  const retryCleanup = async (task: ArchiveProgressTask) => {
+    setRetrying(task.sessionId);
+    setRetryError(null);
+    try {
+      const response = await window.electronAPI.invoke('archive:retry-cleanup', task.sessionId, task.interruptedScript === true);
+      if (!response.success) setRetryError(response.error || 'Could not retry cleanup');
+      await loadProgress();
+    } catch (error) {
+      setRetryError(error instanceof Error ? error.message : 'Could not retry cleanup');
+    } finally {
+      setRetrying(null);
+    }
   };
+
+  useEffect(() => {
+    void loadProgress();
+    const unsubscribeProgress = window.electronAPI.events.onArchiveProgress((data) => {
+      setProgress(data);
+      if (data.activeCount > 0) {
+        setIsExpanded(true);
+      }
+    });
+    const unsubscribeResync = window.electronAPI.events.onRemoteDaemonResyncRequested?.(() => void loadProgress());
+    return () => {
+      unsubscribeProgress();
+      unsubscribeResync?.();
+    };
+  }, [loadProgress]);
+
+  // Refresh elapsed times while a job runs.
+  useEffect(() => {
+    if (!hasActiveTasks) return;
+    const interval = setInterval(() => void loadProgress(), 2000);
+    return () => clearInterval(interval);
+  }, [hasActiveTasks, loadProgress]);
 
   const completedCount = progress?.tasks.filter(task => task.status === 'completed').length ?? 0;
   const failedTask = progress?.tasks.find(task => task.status === 'failed');
@@ -74,38 +104,6 @@ export function ArchiveProgress() {
   if (!progress || progress.totalCount === 0) {
     return <LiveRegion>{archiveAnnouncement}</LiveRegion>;
   }
-
-  const getStatusIcon = (status: ArchiveTask['status']) => {
-    switch (status) {
-      case 'completed':
-        return <CheckCircle className="w-3 h-3 text-status-success" />;
-      case 'failed':
-        return <AlertCircle className="w-3 h-3 text-status-error" />;
-      case 'queued':
-        return <Archive className="w-3 h-3 text-status-waiting" />;
-      default:
-        return <Loader2 className="w-3 h-3 text-status-info animate-spin" />;
-    }
-  };
-
-  const getStatusText = (status: ArchiveTask['status']) => {
-    switch (status) {
-      case 'queued':
-        return 'Queued (waiting for other archives to complete)...';
-      case 'pending':
-        return 'Preparing...';
-      case 'removing-worktree':
-        return 'Removing worktree (this may take a while)...';
-      case 'cleaning-artifacts':
-        return 'Cleaning artifacts...';
-      case 'completed':
-        return 'Completed';
-      case 'failed':
-        return 'Failed';
-      default:
-        return status;
-    }
-  };
 
   const formatElapsedTime = (startTime: string, endTime?: string) => {
     const start = new Date(startTime).getTime();
@@ -123,6 +121,7 @@ export function ArchiveProgress() {
   return (
     <div className="border-t border-border-primary flex-shrink-0">
       <LiveRegion>{archiveAnnouncement}</LiveRegion>
+      {retryError && <div role="alert" className="px-4 py-2 text-xs text-status-error">{retryError}</div>}
       <LiveRegion mode="assertive">{failedTask ? `Archive failed for ${failedTask.sessionName}: ${failedTask.error ?? 'Unknown error'}` : ''}</LiveRegion>
       <button
         type="button"
@@ -196,6 +195,21 @@ export function ArchiveProgress() {
                   {task.error && (
                     <div className="select-text text-xs text-status-error pl-5 mt-1">
                       {task.error}
+                    </div>
+                  )}
+                  {task.cleanupId && (
+                    <div className="text-xs text-text-tertiary pl-5 space-y-1">
+                      {task.status !== 'completed' && <div>Archived; cleanup {task.status === 'failed' ? 'needs attention' : 'pending'}</div>}
+                      {task.remainingPath && task.status === 'failed' && <div className="break-all select-text">{task.remainingPath}</div>}
+                      {(task.attempts ?? 0) > 0 && <div>Failed attempts: {task.attempts}</div>}
+                      {task.nextAttempt && task.status === 'queued' && <div>Retry scheduled for {new Date(task.nextAttempt).toLocaleTimeString()}</div>}
+                      {task.status === 'failed' && (
+                        <button type="button" disabled={retrying === task.sessionId}
+                          className="text-text-primary underline disabled:opacity-50"
+                          onClick={() => void retryCleanup(task)}>
+                          {task.interruptedScript ? 'Retry cleanup (skip interrupted script)' : 'Retry cleanup'}
+                        </button>
+                      )}
                     </div>
                   )}
                   {task.status === 'removing-worktree' && (

@@ -40,6 +40,8 @@ jobs:
             - 'scripts/test-runpane-contract.js'
             - 'scripts/test-runpane-mcp.js'
             - 'scripts/test-runpane-package-smoke.js'
+            - 'scripts/test-runpane-workspace.js'
+            - 'scripts/test-runpane-handoff.js'
             - 'scripts/fixtures/**'
             - '.github/workflows/quality.yml'
           main:
@@ -94,6 +96,24 @@ jobs:
       if: ${{ !cancelled() }}
       run: scripts/ci-background.sh wait lint
 
+  # Offline check of relative links and #anchors in every tracked markdown file.
+  # External URLs are not fetched, so the check never flakes on the network.
+  markdown-links:
+    name: Markdown Links
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Check markdown links
+      uses: lycheeverse/lychee-action@v2
+      with:
+        args: >-
+          --offline --include-fragments --no-progress
+          --exclude-path node_modules --exclude-path dist-electron
+          './**/*.md'
+        fail: true
+
   # Runs beside quality-checks so the Electron smoke path does not wait on
   # typecheck, lint, and unit tests.
   functional-smoke:
@@ -131,6 +151,11 @@ jobs:
 
     - name: Finish Playwright browser dependencies install
       run: scripts/ci-background.sh wait playwright
+
+    - name: Verify renderer selection races
+      run: pnpm test:renderer-selection
+      env:
+        PANE_DIR: ${{ runner.temp }}/pane-renderer-selection
 
     - name: Verify sandboxed Electron preload
       run: xvfb-run -a pnpm exec electron scripts/smoke-sandboxed-preload.cjs
@@ -191,6 +216,12 @@ jobs:
 
     - name: Run package manager smoke tests
       run: node scripts/test-runpane-package-smoke.js
+
+    - name: Run workspace routing tests
+      run: node --test scripts/test-runpane-workspace.js
+
+    - name: Run handoff tests
+      run: node --test scripts/test-runpane-handoff.js
 
   # Ubuntu is already covered by quality-checks above; this job only adds the
   # other platforms, and only when main-process code (or its deps) changed.

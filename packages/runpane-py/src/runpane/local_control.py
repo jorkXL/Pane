@@ -83,6 +83,15 @@ def run_sessions_update(parsed: Any) -> int:
     return print_session_result(result, parsed.json, "Updated")
 
 
+def run_sessions_pin(parsed: Any, pinned: bool) -> int:
+    result = invoke_daemon(
+        "runpane:sessions:update",
+        [{"selector": _session_selector(parsed), "input": {"isPinned": pinned}}],
+        pane_dir=parsed.pane_dir,
+    )
+    return print_session_result(result, parsed.json, "Pinned" if pinned else "Unpinned")
+
+
 def run_sessions_set_agent(parsed: Any) -> int:
     if not parsed.agent:
         raise ValueError("runpane sessions set-agent requires --agent.")
@@ -535,7 +544,57 @@ def run_panes_create(parsed: Any) -> int:
     if parsed.json:
         print_json(result)
     else:
-        print_pane_create_result(result)
+        print_pane_create_result(result, bool(request.get("dryRun")))
+
+    return 0 if result.get("ok") else 1
+
+
+def build_pane_adopt_request(parsed: Any) -> Dict[str, Any]:
+    if parsed.from_json:
+        payload = json.loads(strip_utf8_bom(read_input_source(parsed.from_json)))
+        if not isinstance(payload, dict):
+            raise ValueError("--from-json payload must be an object.")
+        if not payload.get("panes"):
+            raise ValueError("--from-json payload must include at least one pane.")
+        return payload
+
+    if not parsed.repo or not parsed.repo_path or not parsed.name:
+        raise ValueError("runpane panes adopt requires --repo, --path, and --name.")
+    tool = build_tool_spec(parsed, "panes adopt")
+    pinned_override = resolve_pinned_override(parsed)
+    return {
+        "repo": parsed.repo,
+        "panes": [{
+            "path": parsed.repo_path,
+            "name": parsed.name,
+            **optional_value("baseBranch", parsed.base_branch),
+            **optional_value("folder", parsed.folder),
+            "pinned": True if pinned_override is None else pinned_override,
+            "tool": tool,
+            **optional_value("resume", parsed.resume),
+            **optional_value("launch", True if parsed.launch else None),
+        }],
+        **optional_value("dryRun", True if parsed.dry_run else None),
+        **optional_value("noFocus", True if parsed.no_focus else None),
+        **optional_value("focus", True if parsed.focus else None),
+        **optional_value("source", parsed.source if parsed.source in ("user", "agent") else None),
+    }
+
+
+def run_panes_adopt(parsed: Any) -> int:
+    request = build_pane_adopt_request(parsed)
+    confirm_pane_adopt(parsed, request)
+    result = invoke_daemon(
+        "runpane:panes:adopt",
+        [request],
+        pane_dir=parsed.pane_dir,
+        timeout_ms=120_000,
+    )
+
+    if parsed.json:
+        print_json(result)
+    else:
+        print_pane_create_result(result, bool(request.get("dryRun")), "adopt")
 
     return 0 if result.get("ok") else 1
 
@@ -621,7 +680,8 @@ def run_panes_pin(parsed: Any, pinned: bool) -> int:
     if parsed.json:
         print_json(result)
     else:
-        print(f"{'Pinned' if result.get('pinned') else 'Unpinned'} {result.get('paneId')}")
+        action = ("Would pin" if result.get("pinned") else "Would unpin") if result.get("dryRun") else ("Pinned" if result.get("pinned") else "Unpinned")
+        print(f"{action} {result.get('paneId')}")
 
     return 0
 
@@ -876,7 +936,7 @@ def run_panels_submit(parsed: Any) -> int:
     else:
         input_bytes = result.get("inputBytes", 0)
         suffix = "" if input_bytes == 1 else "s"
-        verb = "Submitted" if result.get("ok") else "Could not verify"
+        verb = "Queued" if (result.get("delivery") or {}).get("state") == "queued" else "Submitted" if result.get("ok") else "Could not verify"
         verified = " verified" if result.get("verifiedSubmitted") else " unverified"
         print(
             f"{verb} {input_bytes} byte{suffix} via {result.get('sequenceName')} "
@@ -894,7 +954,9 @@ def run_panels_submit(parsed: Any) -> int:
 def print_delivery(delivery: Optional[Dict[str, Any]], prefix: str = "") -> None:
     """Where the prompt went, for human output: `Delivery: queued (transcript)`."""
     if delivery:
-        print(f"{prefix}Delivery: {delivery.get('state')} ({delivery.get('evidence')})")
+        message = delivery.get("message") or ("The agent sees this only after its current turn ends. Do not resend." if delivery.get("state") == "queued" else None)
+        suffix = f" — {message}" if message else ""
+        print(f"{prefix}Delivery: {delivery.get('state')} ({delivery.get('evidence')}){suffix}")
 
 
 def mark_suggestion_line(text: str, ghost_text: Optional[str]) -> str:
@@ -932,7 +994,7 @@ def run_panels_submit_composer(parsed: Any) -> int:
     if parsed.json:
         print_json(result)
     else:
-        verb = "Submitted" if result.get("ok") else "Could not verify"
+        verb = "Queued" if (result.get("delivery") or {}).get("state") == "queued" else "Submitted" if result.get("ok") else "Could not verify"
         verified = " verified" if result.get("verifiedSubmitted") else " unverified"
         print(f"{verb} composer with {result.get('sequenceName')} to panel {result.get('panelId')}.{verified}")
         print_delivery(result.get("delivery"))
@@ -1000,6 +1062,8 @@ def build_panel_input_request(parsed: Any, command: str = "input") -> Dict[str, 
         raise ValueError(f"runpane panels {command} requires --text, --keys, or --input-file.")
     if parsed.keys is not None and command != "input":
         raise ValueError("--keys is for panels input; panels submit sends text followed by Enter.")
+    if parsed.interrupt and command != "submit":
+        raise ValueError("--interrupt is for panels submit.")
     if parsed.as_file_pointer and command != "submit":
         raise ValueError("--as-file-pointer is for panels submit; panels input sends exact bytes.")
 
@@ -1013,6 +1077,8 @@ def build_panel_input_request(parsed: Any, command: str = "input") -> Dict[str, 
         "panelId": parsed.panel_id,
         "input": text,
         **optional_value("asFilePointer", True if parsed.as_file_pointer else None),
+        **optional_value("interrupt", True if parsed.interrupt else None),
+        **optional_value("source", parsed.source),
     }
 
 
@@ -1201,6 +1267,18 @@ def confirm_pane_create(parsed: Any, request: Dict[str, Any]) -> None:
 
     count = len(request.get("panes", []))
     answer = input(f"Create {count} Pane pane{'s' if count != 1 else ''}? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        raise ValueError("Cancelled.")
+
+
+def confirm_pane_adopt(parsed: Any, request: Dict[str, Any]) -> None:
+    if parsed.dry_run or parsed.yes:
+        return
+    if not is_interactive_shell():
+        raise ValueError("runpane panes adopt mutates Pane state. Rerun with --yes in non-interactive shells.")
+
+    count = len(request.get("panes", []))
+    answer = input(f"Adopt {count} existing worktree{'s' if count != 1 else ''}? [y/N] ").strip().lower()
     if answer not in {"y", "yes"}:
         raise ValueError("Cancelled.")
 
@@ -1532,12 +1610,15 @@ def print_pane_cost_models(models: list[Dict[str, Any]]) -> None:
         print(f"  {model.get('model')}\t{model.get('totalTokens', 0)} tokens\t{cost}")
 
 
-def print_pane_create_result(result: Dict[str, Any]) -> None:
+def print_pane_create_result(result: Dict[str, Any], dry_run: bool = False, action: str = "create") -> None:
     for item in result.get("items", []):
         name = item.get("name") or f"pane {item.get('index')}"
         if item.get("ok"):
             worktree = f" at {item.get('worktreePath')}" if item.get("worktreePath") else ""
-            print(f"Created {name}: session {item.get('sessionId', 'unknown')} panel {item.get('panelId', 'unknown')}{worktree}")
+            if dry_run:
+                print(f"Would {action} {name}{worktree}")
+                continue
+            print(f"{'Adopted' if action == 'adopt' else 'Created'} {name}: session {item.get('sessionId', 'unknown')} panel {item.get('panelId', 'unknown')}{worktree}")
             readiness = item.get("readiness")
             if readiness:
                 ready_state = "yes" if readiness.get("ok") else "timed out" if readiness.get("timedOut") else "blocked"
@@ -1545,13 +1626,13 @@ def print_pane_create_result(result: Dict[str, Any]) -> None:
                 blocked = readiness.get("blocked")
                 if blocked:
                     print(f"  Blocked: {blocked.get('message')}")
+            print_initial_input_delivery(item.get("initialInput"), "  ")
             association = item.get("association")
             if association:
                 if association.get("ok"):
                     print(f"  Associated with Session {association.get('sessionId')}")
                 else:
                     print(f"  Not associated with Session {association.get('sessionId')}: {association.get('error', 'unknown error')}")
-            print_delivery((item.get("initialInput") or {}).get("delivery"), "  ")
             print_prompt_notes(item, "  ")
             if item.get("nextCommand"):
                 print(f"  Next: {item.get('nextCommand')}")
@@ -1642,9 +1723,30 @@ def print_panel_create_result(result: Dict[str, Any]) -> None:
         blocked = readiness.get("blocked")
         if blocked:
             print(f"Blocked: {blocked.get('message')}")
+    print_initial_input_delivery(result.get("initialInput"))
     print_prompt_notes(result)
     if result.get("nextCommand"):
         print(f"Next: {result.get('nextCommand')}")
+
+
+def print_initial_input_delivery(initial_input: Optional[Dict[str, Any]], prefix: str = "") -> None:
+    if initial_input is None:
+        return
+    status = "submitted" if initial_input.get("submitted") else "delivered but not verified submitted" if initial_input.get("delivered") else "not delivered"
+    strategy = f" via {initial_input['sequenceName']}" if initial_input.get("sequenceName") else ""
+    attempts = ""
+    if "attempts" in initial_input:
+        count = initial_input["attempts"]
+        attempts = f" after {count} attempt{'s' if count != 1 else ''}"
+    staged = ""
+    if "staged" in initial_input:
+        staged = f"; staged: {'yes' if initial_input['staged'] else 'no'}"
+    print(f"{prefix}Initial input: {status}{strategy}{attempts}{staged}")
+    print_delivery(initial_input.get("delivery"), prefix)
+    if initial_input.get("blocked"):
+        print(f"{prefix}Initial input blocked: {initial_input['blocked']['message']}")
+    if initial_input.get("error"):
+        print(f"{prefix}Initial input error: {initial_input['error']['message']}")
 
 
 def print_panel_wait_result(result: Dict[str, Any]) -> None:

@@ -1,4 +1,5 @@
 import type { Page } from '@playwright/test';
+import type { ArchiveProgressSnapshot } from '../shared/types/archiveProgress';
 import type { PaneChatAgent } from '../shared/types/paneChat';
 import type { PanePermissionRequest, PanePermissionResponse } from '../shared/types/permissions';
 import type {
@@ -21,7 +22,7 @@ type AnalyticsMainEvent = {
   properties?: JsonObject;
 };
 
-type ElectronApiMockOptions = {
+export type ElectronApiMockOptions = {
   analyticsConsentShown?: boolean;
   analyticsIdentity?: JsonObject;
   initialConfig?: JsonObject;
@@ -38,6 +39,14 @@ type ElectronApiMockOptions = {
   mainAnalyticsEvents?: AnalyticsMainEvent[];
   initialProjects?: JsonObject[];
   initialSessions?: JsonObject[];
+  initialArchiveProgress?: ArchiveProgressSnapshot;
+  archiveRetryError?: string;
+  /** git:identity answer; git:set-identity marks it configured. */
+  gitIdentity?: { configured: boolean; name: string; email: string };
+  /** Delay before git:identity answers with the identity as it was when called. */
+  gitIdentityDelayMs?: number;
+  /** git:commit answers, in order; success once they run out. */
+  gitCommitResults?: Array<{ success: boolean; error?: string; details?: string; code?: string }>;
   initialPanels?: JsonObject[];
   initialUiState?: Partial<{
     expandedProjects: number[];
@@ -242,6 +251,25 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         }
       }
     };
+    // Per-host navigation memory, keyed the way main keys it: '' is this computer.
+    const navigationMemories = new Map<string, JsonObject>();
+    // Per-host Session tiling, keyed the same way. Kept in localStorage so a
+    // reload reads back what the previous page wrote, as the real per-host
+    // ui-state store does.
+    const sessionWorkspaceLayoutKey = '__pane_test_session_workspace_layouts__';
+    const readSessionWorkspaceLayouts = (): Record<string, JsonObject> => {
+      const raw = window.localStorage.getItem(sessionWorkspaceLayoutKey);
+      if (!raw) return {};
+      try {
+        // SAFETY: only this mock writes that key, with the record below.
+        return JSON.parse(raw) as Record<string, JsonObject>;
+      } catch {
+        return {};
+      }
+    };
+    const writeSessionWorkspaceLayouts = (layouts: Record<string, JsonObject>): void => {
+      window.localStorage.setItem(sessionWorkspaceLayoutKey, JSON.stringify(layouts));
+    };
     const uiState = {
       expandedProjects: [] satisfies number[],
       expandedFolders: [] satisfies string[],
@@ -266,6 +294,8 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
     const sessionDeleteCalls: string[] = [];
     const sessionFavoriteToggleCalls: string[] = [];
     const gitStageAndCommitCalls: Array<{ sessionId: string; message: string }> = [];
+    let gitIdentity = mockOptions.gitIdentity ? clone(mockOptions.gitIdentity) : null;
+    const gitCommitResults = clone(mockOptions.gitCommitResults ?? []);
     const invokeCalls = new Map<string, Array<{ channel: string; args: unknown[] }>>();
     let sessionsGetCount = 0;
     let terminalAckedBytes = 0;
@@ -342,6 +372,9 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         if (prop === 'onTerminalOutput') {
           return (callback: MockEventCallback) => subscribe('terminal-output', callback);
         }
+        if (prop === 'onTerminalCliReady') {
+          return (callback: MockEventCallback) => subscribe('terminal:cliReady', callback);
+        }
         if (prop === 'onTerminalFontUpdated') {
           return (callback: MockEventCallback) => subscribe('config:terminal-font-updated', callback);
         }
@@ -369,6 +402,9 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         if (prop === 'onPanelDeleted') {
           return (callback: MockEventCallback) => subscribe('panel:deleted', callback);
         }
+        if (prop === 'onPanelAgentStatus') {
+          return (callback: MockEventCallback) => subscribe('panel:agent-status', callback);
+        }
         return () => unsubscribe;
       },
     });
@@ -382,6 +418,17 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
 
       const key = args[0] === undefined ? undefined : String(args[0]);
       const value = args[1] === undefined ? undefined : String(args[1]);
+      if (channel === 'terminal:get-shell-settings') {
+        // Raw result, like the host: Windows shells only on a Windows host.
+        return Promise.resolve({
+          shells: mockOptions.platform === 'win32' ? clone(mockOptions.availableShells ?? []) : [],
+          preferredShell: configState.preferredShell ?? 'auto',
+        });
+      }
+      if (channel === 'terminal:set-preferred-shell') {
+        configState.preferredShell = String(args[0]);
+        return Promise.resolve(undefined);
+      }
       if (channel === 'panels:get-layout') {
         return success(clone(key && mockLayouts.has(key) ? mockLayouts.get(key) : mockOptions.initialLayout ?? null));
       }
@@ -419,7 +466,22 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         return success(clone(preferences));
       }
       if (channel === 'archive:get-progress') {
-        return success(null);
+        return success(mockOptions.initialArchiveProgress ?? null);
+      }
+      if (channel === 'archive:retry-cleanup' && mockOptions.archiveRetryError) {
+        return Promise.resolve({ success: false, error: mockOptions.archiveRetryError });
+      }
+      if (channel === 'git:identity' && gitIdentity) {
+        const snapshot = clone(gitIdentity);
+        return new Promise(resolve => setTimeout(resolve, mockOptions.gitIdentityDelayMs ?? 0))
+          .then(() => success(snapshot));
+      }
+      if (channel === 'git:set-identity' && gitIdentity) {
+        gitIdentity = { ...gitIdentity, configured: true };
+        return success();
+      }
+      if (channel === 'git:commit') {
+        return Promise.resolve(gitCommitResults.shift() ?? { success: true });
       }
       return success();
     };
@@ -636,7 +698,6 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
           }
           return response;
         },
-        getAvailableShells: () => success(clone(mockOptions.availableShells ?? [])),
         getMonospaceFonts: () => success([]),
         getSessionPreferences: () => success({}),
       }),
@@ -1036,6 +1097,21 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
           else uiState.repositoriesSectionExpanded = expanded;
           return success();
         },
+        getSessionWorkspaceLayout: (hostId: string | null) =>
+          success(readSessionWorkspaceLayouts()[hostId ?? ''] ?? null),
+        saveSessionWorkspaceLayout: (hostId: string | null, layout: JsonObject | null) => {
+            const layouts = readSessionWorkspaceLayouts();
+          if (layout === null) delete layouts[hostId ?? ''];
+          else layouts[hostId ?? ''] = clone(layout);
+          writeSessionWorkspaceLayouts(layouts);
+          return success();
+        },
+        getNavigationMemory: (hostId: string | null) =>
+          success(clone(navigationMemories.get(hostId ?? '') ?? null)),
+        saveNavigationMemory: (hostId: string | null, memory: JsonObject) => {
+          navigationMemories.set(hostId ?? '', clone(memory));
+          return success();
+        },
       }),
     };
 
@@ -1116,8 +1192,11 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
           pendingPermissions.push(request);
           emit('permission:request', request);
         },
-        emitRemoteDaemonResyncRequested() {
-          emit('remote-daemon:resync-required');
+        emitRemoteDaemonResyncRequested(event: { hostChanged: boolean } = { hostChanged: false }) {
+          emit('remote-daemon:resync-required', event);
+        },
+        getNavigationMemory(hostId: string | null) {
+          return clone(navigationMemories.get(hostId ?? '') ?? null);
         },
         getConfigReadCount() {
           return configGetCount;
@@ -1150,6 +1229,9 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         emitPanelTerminalOutput(sessionId: string, panelId: string, output: string) {
           emit('terminal-output', { sessionId, panelId, output });
         },
+        emitTerminalCliReady(panelId: string) {
+          emit('terminal:cliReady', { panelId });
+        },
         getTerminalAckedBytes() {
           return terminalAckedBytes;
         },
@@ -1161,6 +1243,9 @@ export async function installElectronApiMock(page: Page, options: ElectronApiMoc
         },
         emitPanelUpdated(panel: JsonObject) {
           emit('panel:updated', clone(panel));
+        },
+        emitPanelAgentStatus(panelId: string, sessionId: string, state: string) {
+          emit('panel:agent-status', { panelId, sessionId, state });
         },
         emitPanelDeleted(panelId: string, sessionId: string) {
           emit('panel:deleted', { panelId, sessionId });

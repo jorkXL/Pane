@@ -62,6 +62,9 @@ export class GitStatusManager extends EventEmitter {
   // Smart visibility-aware polling for active sessions only
   private readonly CACHE_TTL_MS = 5000; // 5 seconds cache
   private refreshDebounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  // Callers of a debounced refresh; a later call restarts the timer, so every
+  // waiter gathered before it fires is settled by that one refresh.
+  private refreshWaiters: Map<string, Array<(status: GitStatus | null) => void>> = new Map();
   private readonly DEBOUNCE_MS = 2000; // 2 seconds debounce to batch rapid changes
   private gitLogger: GitStatusLogger;
   private fileWatcher: GitFileWatcher;
@@ -225,8 +228,7 @@ export class GitStatusManager extends EventEmitter {
     this.gitLogger.logSummary();
 
     // Clear any pending debounce timers
-    this.refreshDebounceTimers.forEach(timer => clearTimeout(timer));
-    this.refreshDebounceTimers.clear();
+    [...this.refreshDebounceTimers.keys()].forEach(sessionId => this.cancelRefreshDebounce(sessionId));
 
     // Clear event throttle timer
     if (this.eventThrottleTimer) {
@@ -476,42 +478,68 @@ export class GitStatusManager extends EventEmitter {
     // Create a promise that will be resolved after debounce
     this.gitLogger.logDebounce(sessionId, 'start');
     return new Promise((resolve) => {
+      const waiters = this.refreshWaiters.get(sessionId) ?? [];
+      waiters.push(resolve);
+      this.refreshWaiters.set(sessionId, waiters);
+
       const timer = setTimeout(async () => {
         this.refreshDebounceTimers.delete(sessionId);
+        this.refreshWaiters.delete(sessionId);
         this.gitLogger.logDebounce(sessionId, 'complete');
-        
-        // Fast path: check if git status actually changed before doing expensive operations
-        const session = await this.sessionManager.getSession(sessionId);
-        if (session?.worktreePath) {
-          const hasChanged = await this.hasGitStatusChanged(sessionId, session.worktreePath);
-          if (!hasChanged) {
-            this.logger?.info(`[GitStatus] Quick check: no changes for session ${sessionId}, skipping refresh`);
-            // Still emit updated to clear loading state even if no changes
-            const cached = this.cache[sessionId]?.status || null;
-            if (cached) {
-              this.emitThrottled(sessionId, 'updated', cached);
-              if (this.shouldSchedulePrEnrichment(cached)) {
-                this.schedulePrEnrichment(sessionId);
-              }
-            }
-            resolve(cached);
-            return;
-          }
+
+        let status: GitStatus | null = null;
+        try {
+          status = await this.runDebouncedRefresh(sessionId, isUserInitiated);
+        } catch (error) {
+          this.logger?.error(`[GitStatus] Debounced refresh failed for session ${sessionId}:`, error instanceof Error ? error : new Error(String(error)));
         }
-        
-        const status = await this.fetchGitStatus(sessionId);
-        if (status) {
-          const cachedStatus = this.updateCache(sessionId, status);
-          this.emitThrottled(sessionId, 'updated', cachedStatus);
-          if (this.shouldSchedulePrEnrichment(cachedStatus)) {
-            this.schedulePrEnrichment(sessionId, isUserInitiated);
-          }
-        }
-        resolve(status ? this.cache[sessionId]?.status || status : status);
+        waiters.forEach(settle => settle(status));
       }, this.DEBOUNCE_MS);
 
       this.refreshDebounceTimers.set(sessionId, timer);
     });
+  }
+
+  private async runDebouncedRefresh(sessionId: string, isUserInitiated: boolean): Promise<GitStatus | null> {
+    // Fast path: check if git status actually changed before doing expensive operations
+    const session = await this.sessionManager.getSession(sessionId);
+    if (session?.worktreePath) {
+      const hasChanged = await this.hasGitStatusChanged(sessionId, session.worktreePath);
+      if (!hasChanged) {
+        this.logger?.info(`[GitStatus] Quick check: no changes for session ${sessionId}, skipping refresh`);
+        // Still emit updated to clear loading state even if no changes
+        const cached = this.cache[sessionId]?.status || null;
+        if (cached) {
+          this.emitThrottled(sessionId, 'updated', cached);
+          if (this.shouldSchedulePrEnrichment(cached)) {
+            this.schedulePrEnrichment(sessionId);
+          }
+        }
+        return cached;
+      }
+    }
+
+    const status = await this.fetchGitStatus(sessionId);
+    if (status) {
+      const cachedStatus = this.updateCache(sessionId, status);
+      this.emitThrottled(sessionId, 'updated', cachedStatus);
+      if (this.shouldSchedulePrEnrichment(cachedStatus)) {
+        this.schedulePrEnrichment(sessionId, isUserInitiated);
+      }
+    }
+    return status ? this.cache[sessionId]?.status || status : status;
+  }
+
+  /** Drop a pending debounced refresh, settling its callers with the cached status. */
+  private cancelRefreshDebounce(sessionId: string): void {
+    const timer = this.refreshDebounceTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.refreshDebounceTimers.delete(sessionId);
+    }
+    const waiters = this.refreshWaiters.get(sessionId);
+    this.refreshWaiters.delete(sessionId);
+    waiters?.forEach(settle => settle(this.cache[sessionId]?.status ?? null));
   }
 
   /**
@@ -683,7 +711,7 @@ export class GitStatusManager extends EventEmitter {
 
   private async getCurrentBranchName(worktreePath: string, commandRunner: CommandRunner): Promise<string | null> {
     try {
-      const branchName = (await commandRunner.execAsync('git branch --show-current', worktreePath, { silent: true })).stdout.trim();
+      const branchName = (await commandRunner.execFile('git', ['branch', '--show-current'], worktreePath, { silent: true })).stdout.trim();
       if (branchName) return branchName;
     } catch {
       // Fall back to the worktree folder name below.
@@ -836,11 +864,7 @@ export class GitStatusManager extends EventEmitter {
     this.setGitStatusLoading(sessionId, false);
     
     // Clear any pending debounce timer
-    const timer = this.refreshDebounceTimers.get(sessionId);
-    if (timer) {
-      clearTimeout(timer);
-      this.refreshDebounceTimers.delete(sessionId);
-    }
+    this.cancelRefreshDebounce(sessionId);
   }
   
   /**
@@ -969,7 +993,7 @@ export class GitStatusManager extends EventEmitter {
       if (ahead > 0) {
         // Use git diff --shortstat for commit statistics
         try {
-          const statLine = (await ctx.commandRunner.execAsync(`git diff --shortstat ${comparisonBranch}...HEAD`, session.worktreePath, { silent: true })).stdout.trim();
+          const statLine = (await ctx.commandRunner.execFile('git', ['diff', '--shortstat', `${comparisonBranch}...HEAD`, '--'], session.worktreePath, { silent: true })).stdout.trim();
           if (statLine) {
             const filesMatch = statLine.match(/(\d+) files? changed/);
             const additionsMatch = statLine.match(/(\d+) insertions?\(\+\)/);
@@ -1017,7 +1041,7 @@ export class GitStatusManager extends EventEmitter {
       // Get total number of commits in the branch
       let totalCommits = ahead;
       try {
-        const countStr = (await ctx.commandRunner.execAsync(`git rev-list --count ${comparisonBranch}..HEAD`, session.worktreePath, { silent: true })).stdout.trim();
+        const countStr = (await ctx.commandRunner.execFile('git', ['rev-list', '--count', `${comparisonBranch}..HEAD`, '--'], session.worktreePath, { silent: true })).stdout.trim();
         totalCommits = parseInt(countStr, 10) || ahead;
       } catch {
         // Keep default of ahead if command fails
@@ -1137,12 +1161,8 @@ export class GitStatusManager extends EventEmitter {
     // (verified at line 906 where it is set).
     this.pendingEvents.delete(sessionId);
 
-    // L5: drain refreshDebounceTimers
-    const timer = this.refreshDebounceTimers.get(sessionId);
-    if (timer) {
-      clearTimeout(timer);
-      this.refreshDebounceTimers.delete(sessionId);
-    }
+    // L5: drain refreshDebounceTimers and their waiters
+    this.cancelRefreshDebounce(sessionId);
 
     // L5: drain abortControllers
     const ac = this.abortControllers.get(sessionId);

@@ -1217,8 +1217,8 @@ interface FileEditorProps {
 
 /**
  * The Files inspector: a file tree whose clicks open center editor tabs.
- * Single-click previews, double-click pins (VS Code semantics); the row of
- * the active editor tab's file is highlighted.
+ * Single-click previews, double-click pins (VS Code semantics).
+ * The row of the active editor tab's file is highlighted.
  */
 export function FileEditor({ sessionId, initialState, onStateChange, shortcutsActive = true }: FileEditorProps) {
   const [error, setError] = useState<string | null>(null);
@@ -1247,7 +1247,9 @@ export function FileEditor({ sessionId, initialState, onStateChange, shortcutsAc
   }, [sessionId]);
 
   const handleFileSelect = useCallback((file: FileItem | null) => { void openFile(file, false); }, [openFile]);
-  const handleFileOpen = useCallback((file: FileItem) => { void openFile(file, true); }, [openFile]);
+  const handleFileOpen = useCallback((file: FileItem) => {
+    void openFile(file, true);
+  }, [openFile]);
 
   const previewHtmlFile = useCallback(async (filePath: string) => {
     setError(null);

@@ -66,6 +66,44 @@ reopening, and archiving retain this folder. These folders are not Git
 worktrees or security sandboxes and do not expire with OS temporary files.
 Project implementation belongs in an appropriate Pane/worktree.
 
+## Windows and WSL runtimes
+
+On Windows, **Create Session → Run agent in** appears directly below the agent
+picker when WSL reports installed distributions. Windows is the default on every
+creation. Choose a named distribution to run the agent there; install the agent
+inside that distribution first. Cursor is available when WSL is selected.
+The runtime and distribution belong to the Session and survive reopening,
+application restart, and terminal supervisor restart. Existing records retain
+their host runtime through an additive store migration.
+If creation fails before publishing a terminal owner, Pane removes untouched
+generated files so the name can be retried; user files or edits prevent rollback.
+
+WSL Sessions retain their durable files under the Windows Pane data directory.
+Their agent sees Linux paths such as `/mnt/c/Users/.../.pane/sessions/...`.
+This uses Pane's existing Windows-to-WSL path conversion and requires the default
+`/mnt/<drive>` automount layout; custom `[automount] root` settings are not supported.
+Generated `AGENTS.md` points to a Session-specific `runtime-context.md`; this
+context takes precedence over the shared Pane Chat routing instructions.
+
+Each WSL Session gets a managed `.pane-runtime/runpane` wrapper on PATH, also
+available as `$PANE_RUNPANE_BIN`. It invokes this build's bundled Windows CLI via
+PowerShell interop from Windows TEMP, so the CLI can reach this Pane instance's
+named pipe. Arguments cross as JSON to preserve quotes and Unicode. Temporary
+files beside the bridge carry payloads without Windows command-line size limits
+and are removed when the call exits; stdin remains available to the CLI. File flags
+accept relative or absolute Linux paths (including `--flag=value`); `-` retains
+stdin semantics. `--repo` translates absolute Linux paths and explicit relative
+paths (`.`, `..`, `./...`, `../...`) while preserving repository names and IDs.
+Paths inside JSON request bodies must use Windows paths, and
+Windows paths returned by the CLI can be read in WSL after `wslpath -u` conversion.
+The bridge pins `--pane-dir` to this instance and preserves the calling Session
+and panel identities. PowerShell is invoked by its mounted Windows path, so
+`appendWindowsPath=false` is supported. WSL interop must be enabled; a Linux-installed RunPane CLI
+cannot replace this bridge for a Windows daemon.
+
+For CLI JSON creation, `runtime: "wsl"` and `wslDistribution: "Ubuntu-24.04"`
+select an installed distribution; omitted runtime selects the host.
+
 ## Resuming custom launchers
 
 Use **Enable custom command resume** in Session launch settings or a saved custom
@@ -98,7 +136,10 @@ automatically; use an explicit resume command if you know their ID.
 
 Pinned is the first sidebar category and can contain both Session chats and
 Panes. Right-click a Session to pin or unpin it. The pin preference survives
-restarts; an archived Session stays out of Pinned until it is restored.
+restarts; an archived Session stays out of Pinned until it is restored. RunPane
+can set the same preference with `sessions pin` or `sessions unpin --session
+<id|name>`. Create JSON accepts `isPinned` (default false), and update JSON
+accepts it without changing the preference when omitted.
 
 Click a Session row to open its chat and expand or collapse its associated
 Panes. Child Pane rows are indented beyond the Session chat icon and keep the
@@ -109,9 +150,15 @@ context menus use compact widths.
 The right sidebar has Overview, Files, and Changes tabs. Overview shows linked
 Panes and activity. Files browses the Session workspace. Changes summarizes
 linked worktrees and opens a Pane for detailed review. The upper-right sidebar
-button shows or hides the selected tab. Session file clicks open editor tabs
-beside the agent tab in the title bar. These tabs can be selected and closed
-directly, and reopening a file restores its tab.
+button shows or hides the selected tab. A single Session uses two rows at the
+top: the window title bar shows its name and controls, and the tab strip sits
+directly below it. Session file clicks open editor tabs beside the agent tab in
+that strip. These tabs can be selected and closed directly, and reopening a file
+restores its tab.
+
+![Two-row Session header in Folio](screenshots/two-row-header-folio.png)
+
+![Two-row Session header in Walnut](screenshots/two-row-header-walnut.png)
 
 Right-click a Session to archive it. Archiving hides the chat from the active
 Sessions list while retaining its identity, conversation history, and Pane
@@ -220,6 +267,8 @@ runpane sessions get --session <session-id-or-name> --json
 runpane sessions overview --session <session-id-or-name> --json
 runpane sessions create --from-json <path|-> --json
 runpane sessions update --session <session-id-or-name> --from-json <path|-> --json
+runpane sessions pin --session <session-id-or-name> --json
+runpane sessions unpin --session <session-id-or-name> --json
 runpane sessions set-agent --session <session-id-or-name> --agent <agent> --json
 runpane sessions associate --session <session-id-or-name> --pane <pane-id> --json
 runpane sessions detach --session <session-id-or-name> --pane <pane-id> --json
@@ -410,7 +459,7 @@ composer text carry `heldInputPresent: true`, the JSON form of `STUCK`.
 | User present | Someone is waiting on the result | `--settle 60000 --blocked-settle 15000 --min-interval 120000`, no `--idle-backoff` | about 3 minutes |
 
 Both profiles use the same `--kinds` list, `--quiet`, and named cursor.
-Switch profiles by re-arming the same cursor.
+Switch profiles by stopping the previous monitor, then re-arming the same cursor. If a monitor reports that its cursor was superseded, keep the replacement and do not re-arm the old monitor.
 
 ## Worker reports
 
@@ -455,12 +504,18 @@ worker can be asked to run `runpane report`.
 ## Skill contract
 
 `main/src/services/skillCacheManager.ts` installs the skills that ship in
-`main/src/services/paneChatBundle/` once per run: into
+`main/src/services/paneChatBundle/` into
 `<PANE_DIR>/skills/pane-chat/skills/` and into the `.claude/skills/` and
 `.codex/skills/` folders of the data directory. It also generates the
-`pane-orchestrator` entry skill, the runtime context, and the helper subagents
-in `.claude/agents/` and `.codex/agents/`. A manifest records what it
-installed, so later installs replace only those entries.
+`pane-orchestrator` entry skill (plus a Cursor rule at
+`.cursor/rules/pane-orchestrator.mdc`), the runtime context, and the helper
+subagents in `.claude/agents/` and `.codex/agents/`. A manifest
+(`skills/pane-chat/installed.json`) records what it installed and a hash of the
+bundle: startup skips the install when the hash is unchanged, and later installs
+replace only the recorded entries.
+
+To change Pane Chat behavior, edit the bundle or `buildPaneOrchestratorSkill()`
+in `skillCacheManager.ts`, then run `paneChatBundle.test.ts`.
 
 Bundled workflow skills are available to Sessions and can be selected according
 to the user's task. The installed manifest lets Pane refresh its own skill files
@@ -483,20 +538,60 @@ Sessions keeps their shells and files separate.
 ## Plans, pages, and split view
 
 Agents show pages and files with `runpane panels open --file <path>` or
-`--url <url>`. HTML files open as a browser tab; other files open in an editor
-tab. By default the tab opens in split view: the first one splits the stage to
-the right of the conversation, and later ones join that side group as tabs.
+`--url <url>`. Files open in an editor tab with read-only previews for supported
+formats; HTML opens as read-only source. Use `--url` with an HTTP, HTTPS or file
+URL for an intentional live browser tab. By default the tab opens in split view:
+the first one splits the stage to the right of the conversation, and later ones
+join that side group as tabs.
 `--tab` opens it as a plain tab instead. Reopening the same file or URL reuses
 and reloads its tab. This works the same in Sessions and in project Panes.
 
 Generated Session instructions ask the orchestrator to write plans, reports, and
 other documents as self-contained HTML files in its Session folder and open them
-this way. Opening a Session never submits a prompt or starts work just to write
+with `--url` when rendered HTML is intended, or `--file` to inspect the source.
+Opening a Session never submits a prompt or starts work just to write
 a document.
 
-While the stage is split, each group has its own tab strip and the agent tab
-stays in the top bar. Closing the last tab in the side group returns to a single
+While the stage is split, each group has its own tab strip, including the agent
+tab in its group. For a single Session, the strips align directly below the
+window title bar. Closing the last tab in the side group returns to a single
 group. Layouts are saved with the Session.
+
+## Tiling Sessions side by side
+
+![Two Sessions tiled side by side, both streaming](screenshots/session-tiling.png)
+
+Sessions tile with the same gesture as tabs, one level up. Drag a Session from
+its sidebar row — or by its title row once tiled — onto another Session and drop
+it against an edge to put the two beside each other; drop it in the middle to
+show it in that slot instead. Edge bands are the outer quarter of the target,
+as they are for tabs, and the layout nests as deeply as you take it: a row of
+Sessions with one of them split into a column is an ordinary shape, not a
+special case.
+
+Both halves stay fully live. A tile that is not focused keeps its agent running
+and its output streaming; nothing is throttled or suspended, so a Session you
+are watching out of the corner of your eye is the same Session you were just
+typing in. Each tile keeps its own tab splits, its own Terminal dock, its own
+Files and Changes sidebar, and its own navigation.
+
+The focused tile's Session is the selected one: its title row carries the focus
+ring, and clicking a Session in the sidebar focuses its tile when it already has
+one, or shows it in the focused tile when it does not. With one tile that is
+exactly the old behaviour — switching Sessions replaces the view.
+
+The `X` on a tile's title row stops tiling that Session; the Session itself,
+its conversation and its panels are untouched, and the layout collapses back
+around the space. The last tile has no close button, since a window with no
+Session in it has nothing to show. The command palette carries the same actions
+for the keyboard: focus the Session left, right, above or below, and stop tiling
+the focused one.
+
+A layout belongs to the host it was built on, like the remembered location it
+sits beside: Session ids only mean anything on their own host, so switching
+hosts loads that host's layout and every tile is revalidated against the
+Sessions that still exist there. Archiving or deleting a tiled Session retires
+its tile and collapses the split.
 
 ## Reaching Pane and delegating work
 
@@ -512,8 +607,8 @@ Earlier development builds had an experimental progress view that rendered
 `.pane-progress.json` switch and leaves any HTML files in place.
 
 New worktrees launched from a Session default to unpinned. First association also
-clears a worktree's previous pin so it appears as a Session child. You can pin it
-manually afterward; repeated association does not undo that choice. Independent
+clears a worktree's previous pin, including an explicit `--pinned` creation pin,
+so it appears as a Session child. Use `panes pin` manually afterward; repeated association does not undo that choice. Independent
 worktree defaults and existing historical pins are unchanged.
 
 ### Generated instructions and Git

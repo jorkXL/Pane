@@ -5,6 +5,13 @@ Install or configure Pane from PyPI.
 The package does not include the Pane desktop runtime. It downloads the correct
 Pane release artifact only when you run `runpane install` or `runpane update`.
 
+The same CLI also drives a running Pane app: list and add repos, create and
+manage panes, read and send input to panels, manage sessions, and follow events
+with `runpane watch`. See the
+[runpane CLI contract](https://github.com/greenfield-inc/Pane/blob/main/docs/RUNPANE_CLI_CONTRACT.md) for every command.
+
+`runpane panes adopt` is not in the Python CLI yet; use the npm package for it.
+
 ## Quick Start
 
 Run the guided setup:
@@ -175,10 +182,11 @@ PyPI package downloads use `source=pip` when requesting release artifacts from
 `runpane.com/api/download`. If that route is unavailable, the CLI falls back to
 matching GitHub release assets and prints a warning.
 
-The wrapper also sends best-effort lifecycle telemetry with a persisted
-anonymous `install_id`. Count distinct wrapper users with
-`count(DISTINCT properties.install_id)` on `runpane_wrapper_*` events. Set
-`RUNPANE_TELEMETRY_DISABLED=1` to disable wrapper telemetry.
+The wrapper sends best-effort command failures and download lifecycle telemetry
+with a persisted anonymous `install_id`. Successful routine commands emit nothing.
+Distinct `install_id` counts on `runpane_wrapper_*` events measure installs that
+report failures or download activity, not all CLI users. Telemetry is disabled in
+CI, when local analytics is explicitly opted out, or with `RUNPANE_TELEMETRY_DISABLED=1`.
 
 ## Maintenance Notes
 

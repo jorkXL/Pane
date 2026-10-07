@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
 
 from .version import wrapper_version
+from .command_matching import match_command
 
 TELEMETRY_ENDPOINT = "https://runpane.com/api/runpane/telemetry"
 TELEMETRY_TIMEOUT_SECONDS = 1.5
@@ -29,39 +31,12 @@ def create_initial_telemetry_context(argv: Optional[List[str]] = None) -> Wrappe
     if first == "install":
         target = args[1] if len(args) > 1 and args[1] in {"client", "daemon"} else "client"
         return {"command": "install", "resolved_command": "install", "target": target}
-    if first == "setup":
-        return {"command": "setup"}
     if first == "update":
         return {"command": "update", "resolved_command": "update", "target": "client"}
     if first == "doctor":
         return {"command": "doctor", "resolved_command": "doctor"}
-    if first == "version":
-        return {"command": "version"}
-    if first == "agent-context":
-        return {"command": "agent-context"}
-    if first == "agents":
-        return {"command": "agents doctor" if len(args) > 1 and args[1] == "doctor" else "unknown"}
-    if first == "repos":
-        return {"command": "repos add" if len(args) > 1 and args[1] == "add" else "repos list"}
-    if first == "panes":
-        if len(args) > 1 and args[1] == "list":
-            return {"command": "panes list"}
-        if len(args) > 1 and args[1] == "cost":
-            return {"command": "panes cost"}
-        return {"command": "panes create"}
-    if first == "panels":
-        if len(args) > 1 and args[1] == "output":
-            return {"command": "panels output"}
-        if len(args) > 1 and args[1] == "input":
-            return {"command": "panels input"}
-        if len(args) > 1 and args[1] == "screen":
-            return {"command": "panels screen"}
-        if len(args) > 1 and args[1] == "submit":
-            return {"command": "panels submit"}
-        if len(args) > 1 and args[1] == "wait":
-            return {"command": "panels wait"}
-        return {"command": "panels list"}
-    return {"command": "unknown"}
+    matched = match_command(args)
+    return {"command": matched[0] if matched else "unknown"}
 
 
 def apply_parsed_args_to_telemetry_context(context: WrapperTelemetryContext, parsed: object) -> None:
@@ -172,6 +147,11 @@ def track_wrapper_event(event: str, context: WrapperTelemetryContext) -> None:
     if _telemetry_disabled():
         return
     try:
+        status, config = _read_config(os.path.join(_app_directory(), "config.json"))
+        if status == "ok" and isinstance(config, dict):
+            analytics = config.get("analytics")
+            if isinstance(analytics, dict) and analytics.get("enabled") is False:
+                return
         install_id = get_or_create_wrapper_install_id()
         properties = build_wrapper_telemetry_properties(
             install_id=install_id,
@@ -283,7 +263,7 @@ def _valid_install_id(value: str) -> bool:
 def _sanitize_short_string(value: object) -> Optional[str]:
     if not isinstance(value, str) or len(value) == 0 or len(value) > 80:
         return None
-    if "/" in value or "\\" in value:
+    if value != "latest" and not re.fullmatch(r"v?\d+\.\d+\.\d+(?:-(?:nightly|alpha|beta|rc)[.-]?\d*)?", value):
         return None
     return value
 

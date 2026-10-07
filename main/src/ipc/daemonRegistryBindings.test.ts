@@ -17,6 +17,7 @@ import { registerSessionHandlers } from './session';
 import { registerVoiceHandlers } from './voice';
 import { registerUsageHandlers } from './usage';
 import type { AppServices } from './types';
+import { isDaemonOwnedChannel } from '../../../shared/types/daemon';
 
 const USAGE_CHANNELS = [
   'usage:get-report',
@@ -43,6 +44,9 @@ const PROJECT_CHANNELS = [
 
 const CONFIG_CHANNELS = [
   'remote:pwa-affordances',
+  'remote:settings:update',
+  'terminal:get-shell-settings',
+  'terminal:set-preferred-shell',
 ] as const;
 
 const VOICE_CHANNELS = [
@@ -62,6 +66,7 @@ const PANE_CHAT_CHANNELS = [
   'pane-chat:set-agent',
 ] as const;
 const ORCHESTRATION_SESSION_CHANNELS = [
+  'orchestration-sessions:runtimes',
   'orchestration-sessions:promote',
   'orchestration-sessions:list',
   'orchestration-sessions:select',
@@ -87,6 +92,8 @@ const FILE_CHANNELS = [
   'file:write-binary',
   'file:getPath',
   'git:commit',
+  'git:identity',
+  'git:set-identity',
   'git:revert',
   'git:restore',
   'file:readAtRevision',
@@ -104,6 +111,7 @@ const FILE_CHANNELS = [
 ] as const;
 
 const PANEL_CHANNELS = [
+  'panels:read-browser-file',
   'panels:create',
   'panels:delete',
   'panels:update',
@@ -133,6 +141,10 @@ const PANEL_CHANNELS = [
   'terminal:paste-image',
   'terminal:save-scrollback',
   'terminal:paste-file',
+  'terminal:upload-start',
+  'terminal:upload-chunk',
+  'terminal:upload-commit',
+  'terminal:upload-cancel',
 ] as const;
 
 const SCRIPT_CHANNELS = [
@@ -179,6 +191,8 @@ const SESSION_CHANNELS = [
   'sessions:get-resumable',
   'sessions:resume-interrupted',
   'sessions:dismiss-interrupted',
+  'archive:get-progress',
+  'archive:retry-cleanup',
   'panels:get-output',
   'panels:get-conversation-messages',
   'panels:get-json-messages',
@@ -301,6 +315,7 @@ describe('daemon registry IPC bindings', () => {
             enabled: true,
           }],
           customCommands: [{ name: 'Codex Fast', command: 'codex --yolo' }],
+          defaultOrchestratorAgent: 'codex',
         }),
       },
     } as Partial<AppServices>), registry);
@@ -345,6 +360,8 @@ describe('daemon registry IPC bindings', () => {
           },
         },
       },
+      // Cursor depends on the host platform, so only the agents every host runs are pinned.
+      sessionAgents: { agents: expect.arrayContaining(['claude', 'codex']), defaultAgent: 'codex' },
     });
   });
 
@@ -394,6 +411,8 @@ describe('daemon registry IPC bindings', () => {
   });
 
   it('binds daemon-owned orchestration Session channels through the shared registry', () => {
+    // Discovery must run on the same host that launches the Session agent.
+    expect(isDaemonOwnedChannel('orchestration-sessions:runtimes')).toBe(true);
     const registry = new PaneCommandRegistry();
     const ipcMain = createIpcMainStub();
 
@@ -467,7 +486,8 @@ describe('daemon registry IPC bindings', () => {
     expect(ipcMain.boundChannels).toContain('browser-panel:register-webview');
     expect(
       ipcMain.boundChannels.filter(
-        channel => channel !== 'terminal:clipboard-paste-image' && channel !== 'browser-panel:register-webview',
+        channel => channel !== 'terminal:clipboard-paste-image' && channel !== 'browser-panel:register-webview'
+          && channel !== 'browser-panel:prepare-file',
       ).sort(),
     ).toEqual([...PANEL_CHANNELS].sort());
     expect(registry.has('terminal:clipboard-paste-image')).toBe(false);
@@ -516,13 +536,11 @@ describe('daemon registry IPC bindings', () => {
     expect(registry.listChannels()).toEqual([...SESSION_CHANNELS, 'sessions:set-active-session'].sort());
     expect(ipcMain.boundChannels).toContain('sessions:set-active-session');
     expect(ipcMain.boundChannels).toContain('debug:get-table-structure');
-    expect(ipcMain.boundChannels).toContain('archive:get-progress');
     expect(
       ipcMain.boundChannels.filter(
         channel =>
           channel !== 'sessions:set-active-session' &&
-          channel !== 'debug:get-table-structure' &&
-          channel !== 'archive:get-progress',
+          channel !== 'debug:get-table-structure',
       ).sort(),
     ).toEqual([...SESSION_CHANNELS].sort());
     expect(registry.has('sessions:set-active-session')).toBe(true);

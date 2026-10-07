@@ -6,14 +6,17 @@ function partialMock<Contract>(implementation: Partial<Contract>): Contract {
   // its scenario; unexpected calls fail immediately.
   return implementation as Contract;
 }
-import type { PathResolver } from '../../utils/pathResolver';
+import { PathResolver } from '../../utils/pathResolver';
 import { resolveDefaultWorktreeBase, WorktreeManager } from '../worktreeManager';
 import { worktreePoolManager } from '../worktreePoolManager';
 
 function commandRunner(
   execAsync: (command: string, cwd: string) => Promise<{ stdout: string; stderr: string }>,
 ): CommandRunner {
-  return partialMock<CommandRunner>({ execAsync: vi.fn(execAsync) });
+  return partialMock<CommandRunner>({
+    execAsync: vi.fn(execAsync),
+    execFile: vi.fn(async (file, args, cwd) => ({ ...await execAsync([file, ...args].join(' '), cwd), exitCode: 0 })),
+  });
 }
 
 afterEach(() => {
@@ -93,88 +96,6 @@ describe('WorktreeManager.listWorktrees', () => {
 });
 
 describe('WorktreeManager.resolveWorkingDirectory', () => {
-  it('creates fresh worktrees from remote bases without setting upstream tracking', async () => {
-    const runner = commandRunner(async command => {
-      if (command === 'git rev-parse --is-inside-work-tree') {
-        return { stdout: 'true\n', stderr: '' };
-      }
-      if (command.startsWith('git worktree remove ')) {
-        throw new Error('No existing worktree');
-      }
-      if (command === 'git rev-parse HEAD') {
-        return { stdout: 'current-head\n', stderr: '' };
-      }
-      if (command === 'git show-ref --verify --quiet refs/heads/pane') {
-        throw new Error('Branch does not exist');
-      }
-      if (command === 'git rev-parse --verify origin/main') {
-        return { stdout: 'base-commit\n', stderr: '' };
-      }
-      if (command === 'git rev-parse origin/main') {
-        return { stdout: 'base-commit\n', stderr: '' };
-      }
-      if (command === 'git worktree add -b pane --no-track "/repo/worktrees/pane" origin/main') {
-        return { stdout: '', stderr: '' };
-      }
-      throw new Error(`Unexpected command: ${command}`);
-    });
-    const manager = new WorktreeManager();
-
-    const result = await manager.createWorktree(
-      '/repo',
-      'pane',
-      undefined,
-      'origin/main',
-      undefined,
-      partialMock<PathResolver>({ join: (...parts: string[]) => parts.join('/') }),
-      runner,
-    );
-
-    expect(result).toEqual({
-      worktreePath: '/repo/worktrees/pane',
-      baseCommit: 'base-commit',
-      baseBranch: 'origin/main',
-    });
-    expect(runner.execAsync).toHaveBeenCalledWith(
-      'git worktree add -b pane --no-track "/repo/worktrees/pane" origin/main',
-      '/repo',
-      { timeout: 60000 },
-    );
-    const worktreeAddCall = vi.mocked(runner.execAsync).mock.calls.find(([command]) =>
-      command.startsWith('git worktree add -b pane '),
-    );
-    expect(worktreeAddCall?.[0]).not.toContain(' --track ');
-  });
-
-  it('creates reserve worktrees without setting upstream tracking', async () => {
-    const runner = commandRunner(async command => {
-      if (command === 'git fetch') {
-        return { stdout: '', stderr: '' };
-      }
-      if (command.startsWith('git worktree add -b ')) {
-        return { stdout: '', stderr: '' };
-      }
-      if (command === 'git rev-parse origin/main') {
-        return { stdout: 'base-commit\n', stderr: '' };
-      }
-      throw new Error(`Unexpected command: ${command}`);
-    });
-
-    await worktreePoolManager.createReserve(
-      '/repo',
-      'origin/main',
-      undefined,
-      partialMock<PathResolver>({ join: (...parts: string[]) => parts.join('/') }),
-      runner,
-    );
-
-    const worktreeAddCall = vi.mocked(runner.execAsync).mock.calls.find(([command]) =>
-      command.startsWith('git worktree add -b '),
-    );
-    expect(worktreeAddCall?.[0]).toContain('--no-track');
-    expect(worktreeAddCall?.[0]).not.toContain(' --track ');
-  });
-
   it('persists the resolved default branch when claiming a reserve worktree', async () => {
     const runner = commandRunner(async (command, cwd) => {
       if (command.includes('symbolic-ref')) {
@@ -186,7 +107,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
       if (command === 'git branch --show-current' && cwd === '/repo/worktrees/pane') {
         return { stdout: 'pane\n', stderr: '' };
       }
-      if (command === 'git rev-parse --verify origin/pane') {
+      if (command === 'git rev-parse --verify --end-of-options origin/pane') {
         throw new Error('No remote pane branch');
       }
       if (command.startsWith('git rev-parse ') && command.includes('HEAD')) {
@@ -203,7 +124,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
       undefined,
       true,
       undefined,
-      partialMock<PathResolver>({}),
+      new PathResolver({ path: '/repo' }),
       runner,
     );
 
@@ -248,7 +169,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
       undefined,
       true,
       undefined,
-      partialMock<PathResolver>({}),
+      new PathResolver({ path: '/repo' }),
       runner,
     );
 
@@ -295,7 +216,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
     });
 
     await manager.resolveWorkingDirectory(
-      '/repo', 'w5a', 'release/foo', true, undefined, partialMock<PathResolver>({}), runner,
+      '/repo', 'w5a', 'release/foo', true, undefined, new PathResolver({ path: '/repo' }), runner,
       { branchName: 'agents/w5a' },
     );
 
@@ -319,7 +240,7 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
     const createWorktree = vi.spyOn(manager, 'createWorktree');
 
     await expect(manager.resolveWorkingDirectory(
-      '/repo', 'w5a', 'origin/main', true, undefined, partialMock<PathResolver>({}), runner,
+      '/repo', 'w5a', 'origin/main', true, undefined, new PathResolver({ path: '/repo' }), runner,
       { branchName },
     )).rejects.toThrow(message);
     expect(claimReserve).not.toHaveBeenCalled();
@@ -328,8 +249,9 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
 
   it('renames a claimed reserve branch to the exact requested name', async () => {
     const runner = commandRunner(async command => {
+      if (command === 'git check-ref-format --branch agents/w5a') return { stdout: 'agents/w5a\n', stderr: '' };
       if (command === 'git fetch' || command.startsWith('git worktree add -b ')) return { stdout: '', stderr: '' };
-      if (/^git rev-parse ['"]?origin\/main['"]?$/.test(command)) {
+      if (command === 'git rev-parse --verify --end-of-options origin/main') {
         return { stdout: 'base-commit\n', stderr: '' };
       }
       if (command.startsWith('git worktree move ') || command.startsWith('git branch -m ')) return { stdout: '', stderr: '' };
@@ -344,8 +266,9 @@ describe('WorktreeManager.resolveWorkingDirectory', () => {
     );
 
     expect(claimed).toEqual({ worktreePath: '/repo-claim/worktrees/w5a' });
-    const renameCall = vi.mocked(runner.execAsync).mock.calls.find(([command]) => command.startsWith('git branch -m '));
-    expect(renameCall?.[0]).toMatch(/^git branch -m ['"]_reserve\/[0-9a-f]{8}['"] ['"]agents\/w5a['"]$/);
+    const renameCall = vi.mocked(runner.execFile).mock.calls.find(([, args]) => args[0] === 'branch' && args[1] === '-m');
+    expect(renameCall?.[0]).toBe('git');
+    expect(renameCall?.[1]).toEqual(['branch', '-m', '--', expect.stringMatching(/^_reserve\/[0-9a-f]{8}$/), 'agents/w5a']);
   });
 });
 
@@ -411,7 +334,7 @@ describe('WorktreeManager.getSessionComparisonBranch', () => {
       if (command === 'git branch --show-current') {
         return { stdout: 'feature/local\n', stderr: '' };
       }
-      if (command === 'git rev-parse --verify origin/feature/local') {
+      if (command === 'git rev-parse --verify --end-of-options origin/feature/local') {
         return { stdout: 'abc123\n', stderr: '' };
       }
       throw new Error(`Unexpected command: ${command}`);

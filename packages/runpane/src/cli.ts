@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { RUNPANE_CONTRACT } from './generated/contract';
 import * as os from 'node:os';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
@@ -7,8 +8,10 @@ import { runAgentContext } from './agentContext';
 import { runAgentsSend, runAgentsStart, runAgentsStatus } from './agentTasks';
 import { daemonActionFor, runDaemonAction } from './daemonActions';
 import { runDocsRead, runDocsSearch } from './docs';
+import { runHandoff } from './handoff';
 import { runLinksCreate } from './links';
-import { helpText, parseRunpaneArgs, type ParsedArgs } from './commands';
+import { helpText, parseRunpaneArgs, splitWorkspacePassThrough, type ParsedArgs, type RunpaneCommand } from './commands';
+import { routeDaemonCallsTo } from './daemonClient';
 import { boundary, decodeBoundary } from './boundaryDecoder';
 import { downloadArtifact } from './download';
 import { runDoctor } from './doctor';
@@ -52,6 +55,7 @@ import {
   runLockRelease,
   runSessionsSetAgent,
   runSessionsUpdate,
+  runSessionsPin,
   runReposAdd,
   runReposList,
   runWatch,
@@ -68,6 +72,18 @@ import {
   type WrapperTelemetryContext
 } from './telemetry';
 import { printVersion } from './version';
+import {
+  readTailnet,
+  readWorkspaceSummary,
+  resolveMachine,
+  runWorkspaceExec,
+  runWorkspaceList,
+  runWorkspaceRead,
+  runWorkspaceSetEnabled,
+  runWorkspaceWrite,
+  workspaceHintFor,
+  workspaceTarget
+} from './workspace';
 
 const SOURCE = 'npm' as const;
 
@@ -75,6 +91,10 @@ export async function main(argv: string[]): Promise<number> {
   const telemetryContext = createInitialTelemetryContext(argv);
   if (argv.length === 0) {
     return runTrackedCommand(telemetryContext, () => runNoArgsEntrypoint(telemetryContext));
+  }
+  const passThrough = splitWorkspacePassThrough(argv);
+  if (passThrough) {
+    return runOnMachine(passThrough.machine, passThrough.command);
   }
 
   let parsed: ParsedArgs;
@@ -99,219 +119,244 @@ export async function main(argv: string[]): Promise<number> {
     return dispatchParsedCommand(parsed, telemetryContext);
   }
 
-  return runTrackedCommand(telemetryContext, () => dispatchParsedCommand(parsed, telemetryContext));
+  return runTrackedCommand(telemetryContext, () => dispatchWithWorkspaceHint(parsed, telemetryContext));
 }
 
-async function dispatchParsedCommand(parsed: ParsedArgs, telemetryContext: WrapperTelemetryContext): Promise<number> {
-  if (parsed.command === 'help') {
+/** Commands that run on this machine only; everything else is a daemon call another machine can answer. */
+const THIS_MACHINE_ONLY = new Set<string>([
+  'help', 'setup', 'install', 'update', 'version', 'doctor', 'daemon repair', 'agent-context', 'mcp',
+  'docs search', 'docs read', 'agents start', 'agents status', 'agents send', 'handoff',
+  // Workspace commands pick their own machine; `workspace state` is a daemon call and passes through.
+  'workspace list', 'workspace enable', 'workspace disable', 'workspace read', 'workspace write', 'workspace exec',
+]);
+
+/** `runpane workspace <machine> <command...>`: the same command, answered by that machine's Pane. */
+async function runOnMachine(machineQuery: string, command: string[]): Promise<number> {
+  const parsed = parseRunpaneArgs(command);
+  if (THIS_MACHINE_ONLY.has(parsed.command)) {
+    throw new Error(`runpane ${parsed.command} runs on this machine only. On ${machineQuery}, use: runpane workspace ${machineQuery} exec -- runpane ${command.join(' ')}`);
+  }
+  const tailnet = await readTailnet();
+  if (!tailnet.ok) throw new Error(`runpane workspace needs Tailscale: ${tailnet.reason}. ${tailnet.fix}`);
+  routeDaemonCallsTo(workspaceTarget(resolveMachine(machineQuery, [tailnet.self, ...tailnet.machines])));
+  try {
+    return await main(command);
+  } finally {
+    routeDaemonCallsTo(null);
+  }
+}
+
+async function dispatchWithWorkspaceHint(parsed: ParsedArgs, telemetryContext: WrapperTelemetryContext): Promise<number> {
+  try {
+    return await dispatchParsedCommand(parsed, telemetryContext);
+  } catch (error) {
+    if (error instanceof Error) {
+      const hint = await workspaceHintFor(error, parsed).catch(() => null);
+      if (hint) error.message = `${error.message}\n${hint}`;
+    }
+    throw error;
+  }
+}
+
+type CommandHandler = (parsed: ParsedArgs, telemetryContext: WrapperTelemetryContext) => number | Promise<number>;
+
+const commandHandlers = new Map<string, CommandHandler>(Object.entries({
+  'help': async (parsed, telemetryContext) => {
     console.log(helpText(parsed.helpTopic));
+    if (!parsed.helpTopic || parsed.helpTopic === 'workspace') {
+      console.log(['', ...(await readWorkspaceSummary(parsed.paneDir)).lines].join('\n'));
+    }
     return 0;
-  }
-
-  if (parsed.command === 'setup') {
+  },
+  'setup': async (parsed, telemetryContext) => {
     return runNoArgsEntrypoint(telemetryContext);
-  }
-
-  if (parsed.command === 'version') {
+  },
+  'version': async (parsed, telemetryContext) => {
     return printVersion(parsed.panePath);
-  }
-
-  if (parsed.command === 'doctor') {
+  },
+  'doctor': async (parsed, telemetryContext) => {
     return runDoctor(parsed, SOURCE);
-  }
-
-  if (parsed.command === 'daemon repair') {
+  },
+  'daemon repair': async (parsed, telemetryContext) => {
     return runDaemonRepair(parsed);
-  }
-
-  if (parsed.command === 'agent-context') {
+  },
+  'agent-context': async (parsed, telemetryContext) => {
     return runAgentContext(parsed);
-  }
-
-  if (parsed.command === 'mcp') {
+  },
+  'mcp': async (parsed, telemetryContext) => {
     const { runMcpServer } = await import('./mcp');
     return runMcpServer({ toolsets: parsed.toolsets, readOnly: parsed.readOnly === true });
-  }
-
-  const daemonAction = daemonActionFor(parsed.command);
-  if (daemonAction) {
-    return runDaemonAction(parsed, daemonAction);
-  }
-
-  if (parsed.command === 'links create') {
+  },
+  'links create': async (parsed, telemetryContext) => {
     return runLinksCreate(parsed);
-  }
-
-  if (parsed.command === 'docs search') {
+  },
+  'docs search': async (parsed, telemetryContext) => {
     return runDocsSearch(parsed);
-  }
-
-  if (parsed.command === 'docs read') {
+  },
+  'docs read': async (parsed, telemetryContext) => {
     return runDocsRead(parsed);
-  }
-
-  if (parsed.command === 'agents start') {
+  },
+  'agents start': async (parsed, telemetryContext) => {
     return runAgentsStart(parsed);
-  }
-
-  if (parsed.command === 'agents status') {
+  },
+  'agents status': async (parsed, telemetryContext) => {
     return runAgentsStatus(parsed);
-  }
-
-  if (parsed.command === 'agents send') {
+  },
+  'agents send': async (parsed, telemetryContext) => {
     return runAgentsSend(parsed);
-  }
-
-  if (parsed.command === 'repos list') {
+  },
+  'repos list': async (parsed, telemetryContext) => {
     return runReposList(parsed);
-  }
-
-  if (parsed.command === 'repos add') {
+  },
+  'repos add': async (parsed, telemetryContext) => {
     return runReposAdd(parsed);
-  }
-
-  if (parsed.command === 'panes list') {
+  },
+  'panes list': async (parsed, telemetryContext) => {
     return runPanesList(parsed);
-  }
-
-  if (parsed.command === 'panes cost') {
+  },
+  'panes cost': async (parsed, telemetryContext) => {
     return runPanesCost(parsed);
-  }
-
-  if (parsed.command === 'sessions list') {
+  },
+  'sessions list': async (parsed, telemetryContext) => {
     return runSessionsList(parsed);
-  }
-
-  if (parsed.command === 'sessions create') {
+  },
+  'sessions create': async (parsed, telemetryContext) => {
     return runSessionsCreate(parsed);
-  }
-
-  if (parsed.command === 'sessions get') {
+  },
+  'sessions get': async (parsed, telemetryContext) => {
     return runSessionsGet(parsed);
-  }
-
-  if (parsed.command === 'sessions update') {
+  },
+  'sessions update': async (parsed, telemetryContext) => {
     return runSessionsUpdate(parsed);
-  }
-
-  if (parsed.command === 'sessions set-agent') {
+  },
+  'sessions pin': async (parsed) => runSessionsPin(parsed, true),
+  'sessions unpin': async (parsed) => runSessionsPin(parsed, false),
+  'sessions set-agent': async (parsed, telemetryContext) => {
     return runSessionsSetAgent(parsed);
-  }
-
-  if (parsed.command === 'sessions associate') {
+  },
+  'sessions associate': async (parsed, telemetryContext) => {
     return runSessionsAssociate(parsed);
-  }
-
-  if (parsed.command === 'sessions detach') {
+  },
+  'sessions detach': async (parsed, telemetryContext) => {
     return runSessionsDetach(parsed);
-  }
-
-  if (parsed.command === 'sessions overview') {
+  },
+  'sessions overview': async (parsed, telemetryContext) => {
     return runSessionsOverview(parsed);
-  }
-
-  if (parsed.command === 'lock acquire') {
+  },
+  'lock acquire': async (parsed, telemetryContext) => {
     return runLockAcquire(parsed);
-  }
-
-  if (parsed.command === 'lock release') {
+  },
+  'lock release': async (parsed, telemetryContext) => {
     return runLockRelease(parsed);
-  }
-
-  if (parsed.command === 'lock list') {
+  },
+  'lock list': async (parsed, telemetryContext) => {
     return runLockList(parsed);
-  }
-
-  if (parsed.command === 'workspace state') {
+  },
+  'workspace state': async (parsed, telemetryContext) => {
     return runWorkspaceState(parsed);
-  }
-
-  if (parsed.command === 'watch') {
+  },
+  'workspace list': async (parsed) => runWorkspaceList(parsed),
+  'workspace enable': async (parsed) => runWorkspaceSetEnabled(parsed, true),
+  'workspace disable': async (parsed) => runWorkspaceSetEnabled(parsed, false),
+  'workspace read': async (parsed) => runWorkspaceRead(parsed),
+  'workspace write': async (parsed) => runWorkspaceWrite(parsed),
+  'workspace exec': async (parsed) => runWorkspaceExec(parsed),
+  'handoff': async (parsed) => runHandoff(parsed),
+  'watch': async (parsed, telemetryContext) => {
     return runWatch(parsed);
-  }
-
-  if (parsed.command === 'panes create') {
+  },
+  'panes create': async (parsed, telemetryContext) => {
     return runPanesCreate(parsed);
-  }
-
-  if (parsed.command === 'panes adopt') {
+  },
+  'panes adopt': async (parsed, telemetryContext) => {
     return runPanesAdopt(parsed);
-  }
-
-  if (parsed.command === 'panes archive') {
+  },
+  'panes archive': async (parsed, telemetryContext) => {
     return runPanesArchive(parsed);
-  }
-
-  if (parsed.command === 'panes pin') {
+  },
+  'panes pin': async (parsed, telemetryContext) => {
     return runPanesPin(parsed, true);
-  }
-
-  if (parsed.command === 'panes unpin') {
+  },
+  'panes unpin': async (parsed, telemetryContext) => {
     return runPanesPin(parsed, false);
-  }
-
-  if (parsed.command === 'panes rename') {
+  },
+  'panes rename': async (parsed, telemetryContext) => {
     return runPanesRename(parsed);
-  }
-
-  if (parsed.command === 'panes focus') {
+  },
+  'panes focus': async (parsed, telemetryContext) => {
     return runPanesFocus(parsed);
-  }
-
-  if (parsed.command === 'panels list') {
+  },
+  'panels list': async (parsed, telemetryContext) => {
     return runPanelsList(parsed);
-  }
-
-  if (parsed.command === 'panels create') {
+  },
+  'panels create': async (parsed, telemetryContext) => {
     return runPanelsCreate(parsed);
-  }
-
-  if (parsed.command === 'panels open') {
+  },
+  'panels open': async (parsed, telemetryContext) => {
     return runPanelsOpen(parsed);
-  }
-
-  if (parsed.command === 'panels output') {
+  },
+  'panels output': async (parsed, telemetryContext) => {
     return runPanelsOutput(parsed);
-  }
-
-  if (parsed.command === 'panels input') {
+  },
+  'panels input': async (parsed, telemetryContext) => {
     return runPanelsInput(parsed);
-  }
-
-  if (parsed.command === 'panels screen') {
+  },
+  'panels screen': async (parsed, telemetryContext) => {
     return runPanelsScreen(parsed);
-  }
-
-  if (parsed.command === 'panels submit') {
+  },
+  'panels submit': async (parsed, telemetryContext) => {
     return runPanelsSubmit(parsed);
-  }
-
-  if (parsed.command === 'panels submit-composer') {
+  },
+  'panels submit-composer': async (parsed, telemetryContext) => {
     return runPanelsSubmitComposer(parsed);
-  }
-
-  if (parsed.command === 'panels wait') {
+  },
+  'panels wait': async (parsed, telemetryContext) => {
     return runPanelsWait(parsed);
-  }
-
-  if (parsed.command === 'panels last-message') {
+  },
+  'panels last-message': async (parsed, telemetryContext) => {
     return runPanelsLastMessage(parsed);
-  }
-
-  if (parsed.command === 'report') {
+  },
+  'report': async (parsed, telemetryContext) => {
     return runReport(parsed);
-  }
-
-  if (parsed.command === 'agents doctor') {
+  },
+  'agents doctor': async (parsed, telemetryContext) => {
     return runAgentsDoctor(parsed);
-  }
-
-  if (parsed.command === 'install' || parsed.command === 'update') {
+  },
+  'install': async (parsed, telemetryContext) => {
     return installOrUpdate(parsed, telemetryContext);
-  }
+  },
+  'update': async (parsed, telemetryContext) => {
+    return installOrUpdate(parsed, telemetryContext);
+  },
+  'panes git-status': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes commit': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes push': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes pull': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes rebase-main': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes restore': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes squash-rebase': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes stash': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes stash-pop': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes soft-reset': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes fetch': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes run-script': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes stop-script': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'panes move': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'folders list': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'folders create': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+  'links open': (parsed) => { const action = daemonActionFor(parsed.command); if (!action) throw new Error('Missing daemon action'); return runDaemonAction(parsed, action); },
+} satisfies Record<RunpaneCommand, CommandHandler>));
 
-  console.log(helpText());
-  return 0;
+const contractCommands = new Set<string>(RUNPANE_CONTRACT.commands.map(command => command.name));
+const missingHandlers = [...contractCommands].filter(command => !commandHandlers.has(command));
+const unexpectedHandlers = [...commandHandlers.keys()].filter(command => !contractCommands.has(command));
+if (missingHandlers.length) throw new Error('Missing command handlers: '+missingHandlers.join(', '));
+if (unexpectedHandlers.length) throw new Error('Unexpected command handlers: '+unexpectedHandlers.join(', '));
+
+async function dispatchParsedCommand(parsed: ParsedArgs, telemetryContext: WrapperTelemetryContext): Promise<number> {
+  const handler = commandHandlers.get(parsed.command);
+  if (!handler) throw new Error('Unsupported command: '+parsed.command);
+  return handler(parsed, telemetryContext);
 }
 
 const daemonRepairResultSchema = boundary.object({
@@ -368,13 +413,10 @@ async function runTrackedCommand(
   telemetryContext: WrapperTelemetryContext,
   execute: () => Promise<number>
 ): Promise<number> {
-  await trackWrapperEvent('runpane_wrapper_command_started', telemetryContext);
   try {
     const code = await execute();
     telemetryContext.exitCode = code;
-    if (code === 0) {
-      await trackWrapperEvent('runpane_wrapper_command_succeeded', telemetryContext);
-    } else {
+    if (code !== 0) {
       telemetryContext.failureStage ??= inferFailureStage(telemetryContext);
       telemetryContext.failureCategory ??= 'process_exit';
       await trackWrapperEvent('runpane_wrapper_command_failed', telemetryContext);

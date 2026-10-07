@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { API } from '../utils/api';
 import { useSessionStore } from '../stores/sessionStore';
 import type { Session } from '../types/session';
@@ -20,6 +21,7 @@ import { useMainRepoGitActions } from '../hooks/useMainRepoGitActions';
 import { useProjectViewActionsStore } from '../stores/projectViewActionsStore';
 import { useNavigationStore } from '../stores/navigationStore';
 import { PANEL_CAPABILITIES } from '../../../shared/types/panels';
+import { shouldActivateReopenedPanel } from '../utils/panelLayout';
 import type { ProjectEnvironment } from '../../../shared/types/panels';
 
 interface ProjectViewProps {
@@ -63,7 +65,15 @@ export const ProjectView: React.FC<ProjectViewProps> = ({
     addPanel,
     removePanel,
     updatePanelState,
-  } = usePanelStore();
+  } = usePanelStore(useShallow(state => ({
+    panels: state.panels,
+    activePanels: state.activePanels,
+    setPanels: state.setPanels,
+    setActivePanel: state.setActivePanel,
+    addPanel: state.addPanel,
+    removePanel: state.removePanel,
+    updatePanelState: state.updatePanelState,
+  })));
 
   // Detail panel state
   const [detailVisible, setDetailVisible] = useState(() => {
@@ -380,14 +390,24 @@ export const ProjectView: React.FC<ProjectViewProps> = ({
       }
     };
 
+    // Reopening a file through `runpane panels open` updates its existing tab.
+    const handlePanelUpdated = (panel: ToolPanel) => {
+      if (panel.sessionId !== mainRepoSessionId) return;
+      const previous = usePanelStore.getState().panels[mainRepoSessionId]?.find(p => p.id === panel.id);
+      updatePanelState(panel);
+      if (shouldActivateReopenedPanel(panel, previous)) setActivePanelInStore(mainRepoSessionId, panel.id);
+    };
+
     // Listen for panel events
     const unsubscribeCreated = window.electronAPI?.events?.onPanelCreated?.(handlePanelCreated);
+    const unsubscribeUpdated = window.electronAPI?.events?.onPanelUpdated?.(handlePanelUpdated);
 
     // Cleanup
     return () => {
       unsubscribeCreated?.();
+      unsubscribeUpdated?.();
     };
-  }, [mainRepoSessionId, addPanel]);
+  }, [mainRepoSessionId, addPanel, updatePanelState, setActivePanelInStore]);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-bg-primary">

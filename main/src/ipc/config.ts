@@ -2,16 +2,20 @@ import { IpcMain } from 'electron';
 import { execFile } from 'child_process';
 import type { AppServices } from './types';
 import type { AppConfig, UpdateConfigRequest } from '../types/config';
-import type { PaneCommandRegistry } from '../daemon/commandRegistry';
-import type { RemotePwaAffordances } from '../../../shared/types/remoteDaemon';
+import type { PaneCommandRegistry, PaneCommandValue } from '../daemon/commandRegistry';
+import type { RemotePwaAffordances, RemotePwaSessionAgents, RemoteSettingsPatch } from '../../../shared/types/remoteDaemon';
+import { SHORTCUT_LETTER, sharedShortcutLetter } from '../../../shared/utils/terminalShortcuts';
 import type { VoiceTranscriptionMode } from '../../../shared/types/voiceTranscription';
 import { ShellDetector } from '../utils/shellDetector';
 import { syncAutoStartOnBoot } from '../utils/autoStart';
 import { applyManagedAgentsMdSetting } from '../services/agentContextManager';
 import { syncPaneMcpForApp } from '../services/paneMcpRegistration';
 import { isPaneHomeSkillEnabled, syncPaneHomeSkill } from '../services/paneHomeSkill';
-import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
+import { boundary, decodeBoundary, type BoundarySchema } from '../../../shared/validation/boundaryDecoder';
 import { AppearanceValidationError } from '../../../shared/types/appearance';
+import { agentPresetsForPlatform } from '../../../shared/constants/agentLaunchPresets';
+import { normalizePaneChatAgent, type PaneChatAgent } from '../../../shared/types/paneChat';
+import { getPaneEventSink } from '../core/runtime';
 
 export function registerConfigHandlers(
   ipcMain: IpcMain,
@@ -19,7 +23,7 @@ export function registerConfigHandlers(
   commandRegistry?: PaneCommandRegistry,
 ): void {
   if (commandRegistry) {
-    commandRegistry.register('remote:pwa-affordances', (): RemotePwaAffordances => {
+    const buildAffordances = (): RemotePwaAffordances => {
       const config = configManager.getConfig();
       return {
         terminalShortcuts: (config.terminalShortcuts ?? []).map(shortcut => ({
@@ -34,9 +38,36 @@ export function registerConfigHandlers(
           command: command.command,
         })),
         voiceTranscription: buildRemotePwaVoiceAffordance(config),
+        sessionAgents: buildRemotePwaSessionAgents(config.defaultOrchestratorAgent),
       };
-    });
+    };
+    commandRegistry.register('remote:pwa-affordances', buildAffordances);
     commandRegistry.bindChannel(ipcMain, 'remote:pwa-affordances');
+
+    // The settings a paired phone may write: the shortcut list and voice keys. Key sharing has its own commands.
+    commandRegistry.register('remote:settings:update', async (patch: PaneCommandValue): Promise<RemotePwaAffordances> => {
+      const unknown = Object.keys(decodeBoundary(patch, boundary.jsonObject)).filter(field => !(field in remoteSettingsFields));
+      if (unknown.length > 0) throw new Error(`remote:settings:update does not accept ${unknown.join(', ')}`);
+      const decoded: RemoteSettingsPatch = decodeBoundary(patch, boundary.object(remoteSettingsFields));
+      const taken = sharedShortcutLetter(decoded.terminalShortcuts ?? []);
+      if (taken) throw new Error(`Two enabled shortcuts use the letter ${taken}`);
+      await configManager.updateConfig(decoded);
+      notifySettingsChanged();
+      return buildAffordances();
+    });
+    commandRegistry.bindChannel(ipcMain, 'remote:settings:update');
+
+    // Terminals spawn on the active host, so a remote client reads and sets the host's shell.
+    commandRegistry.register('terminal:get-shell-settings', () => ({
+      shells: ShellDetector.getAvailableShells(),
+      preferredShell: configManager.getConfig().preferredShell ?? 'auto',
+    }));
+    commandRegistry.register('terminal:set-preferred-shell', async (shell: PaneCommandValue) => {
+      await configManager.updateConfig({
+        preferredShell: decodeBoundary(shell, boundary.enumeration('auto', 'gitbash', 'powershell', 'pwsh', 'cmd')),
+      });
+    });
+    commandRegistry.bindChannels(ipcMain, ['terminal:get-shell-settings', 'terminal:set-preferred-shell']);
   }
 
   ipcMain.handle('config:get', async (): Promise<{ success: boolean; data?: AppConfig; error?: string }> => {
@@ -127,6 +158,7 @@ export function registerConfigHandlers(
         }
       }
 
+      notifySettingsChanged();
       return { success: true, data: updatedConfig };
     } catch (error) {
       console.error('Failed to update config:', error);
@@ -154,17 +186,6 @@ export function registerConfigHandlers(
     } catch (error) {
       console.error('Failed to update session creation preferences:', error);
       return { success: false, error: 'Failed to update session creation preferences' };
-    }
-  });
-
-  ipcMain.handle('config:get-available-shells', async () => {
-    try {
-      const shells = ShellDetector.getAvailableShells();
-      return { success: true, data: shells };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to get available shells';
-      console.error('Failed to get available shells:', error);
-      return { success: false, error: message };
     }
   });
 
@@ -268,12 +289,46 @@ export function registerConfigHandlers(
   });
 }
 
+/** Tells phones and desktop to refetch `remote:pwa-affordances`. Carries no values, so no key ever rides an event. */
+function notifySettingsChanged(): void {
+  getPaneEventSink().send('remote:settings-changed');
+}
+
+const shortcutLetter: BoundarySchema<string> = {
+  decode(current) {
+    const value = boundary.string.decode(current);
+    return SHORTCUT_LETTER.test(value) ? value : current.fail('expected one letter from a to z');
+  },
+};
+
+const remoteSettingsFields = {
+  terminalShortcuts: boundary.optional(boundary.array(boundary.object({
+    id: boundary.nonEmptyString,
+    label: boundary.string,
+    key: shortcutLetter,
+    text: boundary.string,
+    enabled: boundary.boolean,
+  }))),
+  deepgramApiKey: boundary.optional(boundary.nonEmptyString),
+  openRouterApiKey: boundary.optional(boundary.nonEmptyString),
+  falApiKey: boundary.optional(boundary.nonEmptyString),
+};
+
+function buildRemotePwaSessionAgents(configuredAgent: PaneChatAgent | undefined): RemotePwaSessionAgents {
+  const agents = agentPresetsForPlatform(process.platform)
+    .map(preset => preset.id)
+    .filter((agent): agent is PaneChatAgent => agent === 'claude' || agent === 'codex' || agent === 'cursor');
+  const preferred = normalizePaneChatAgent(configuredAgent);
+  return { agents, defaultAgent: agents.includes(preferred) ? preferred : agents[0] ?? preferred };
+}
+
 function buildRemotePwaVoiceAffordance(config: AppConfig): RemotePwaAffordances['voiceTranscription'] {
   const fal = hasConfiguredValue(config.falApiKey, process.env.FAL_KEY);
   const deepgram = hasConfiguredValue(config.deepgramApiKey, process.env.DEEPGRAM_API_KEY);
   const openRouter = hasConfiguredValue(config.openRouterApiKey, process.env.OPENROUTER_API_KEY);
-  const recorded = fal && openRouter;
-  const streaming = deepgram && openRouter;
+  // OpenRouter only cleans up the text; each mode works without it.
+  const recorded = fal;
+  const streaming = deepgram;
   const availableModes: VoiceTranscriptionMode[] = [];
 
   if (streaming) {

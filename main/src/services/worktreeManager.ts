@@ -1,6 +1,5 @@
 import { mkdir } from 'fs/promises';
 import { withLock } from '../utils/mutex';
-import { escapeShellArg } from '../utils/shellEscape';
 import type { ConfigManager } from './configManager';
 import type { AnalyticsManager } from './analyticsManager';
 import { PathResolver } from '../utils/pathResolver';
@@ -11,6 +10,7 @@ import { worktreePoolManager } from './worktreePoolManager';
 import { ensureFastGitConfig, forceRemoveWorktree } from './gitPerformanceConfig';
 import { removeWorktreeViaTrash, sweepWorktreeTrash, type WorktreeTrashDeletion } from './worktreeTrash';
 import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDecoder';
+import { withArchiveRepositoryLock } from './archiveRepositoryLock';
 
 type WorktreeAuditSource = 'session-delete' | 'project-delete' | 'create-cleanup';
 
@@ -92,7 +92,7 @@ export async function detectGitBase(
       let isRemoteBranch = false;
       let remotePrefix = '';
       try {
-        const { stdout } = await commandRunner.execAsync('git remote', projectPath);
+        const { stdout } = await commandRunner.execFile('git', ['remote'], projectPath);
         const remotes = stdout.trim().split('\n').filter(Boolean);
         for (const remote of remotes) {
           if (baseBranch.startsWith(`${remote}/`)) {
@@ -106,13 +106,14 @@ export async function detectGitBase(
       }
 
       const branchName = isRemoteBranch ? baseBranch.slice(remotePrefix.length) : baseBranch;
+      await commandRunner.execFile('git', ['check-ref-format', '--branch', branchName], projectPath);
       try {
-        await commandRunner.execAsync(`git checkout ${escapeShellArg(branchName)}`, projectPath);
+        await commandRunner.execFile('git', ['checkout', branchName], projectPath);
       } catch {
         // Local branch may not exist yet — create it tracking the remote
         if (isRemoteBranch) {
-          await commandRunner.execAsync(
-            `git checkout -b ${escapeShellArg(branchName)} --track ${escapeShellArg(baseBranch)}`,
+          await commandRunner.execFile(
+            'git', ['checkout', '-b', branchName, '--track', baseBranch],
             projectPath
           );
         } else {
@@ -123,11 +124,11 @@ export async function detectGitBase(
   } else {
     // Detect current branch's remote tracking ref
     try {
-      const localBranch = (await commandRunner.execAsync('git branch --show-current', projectPath)).stdout.trim();
+      const localBranch = (await commandRunner.execFile('git', ['branch', '--show-current'], projectPath)).stdout.trim();
       if (localBranch) {
         const remoteRef = `origin/${localBranch}`;
         try {
-          await commandRunner.execAsync(`git rev-parse --verify ${escapeShellArg(remoteRef)}`, projectPath);
+          await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', remoteRef], projectPath);
           actualBaseBranch = remoteRef;
         } catch {
           // No remote tracking branch — leave undefined
@@ -140,7 +141,7 @@ export async function detectGitBase(
 
   try {
     const commitRef = actualBaseBranch || 'HEAD';
-    baseCommit = (await commandRunner.execAsync(`git rev-parse ${escapeShellArg(commitRef)}`, projectPath)).stdout.trim();
+    baseCommit = (await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', commitRef], projectPath)).stdout.trim();
   } catch {
     // Leave undefined if git commands fail
   }
@@ -158,14 +159,14 @@ export async function resolveDefaultWorktreeBase(
   commandRunner: CommandRunner,
 ): Promise<string> {
   try {
-    const { stdout } = await commandRunner.execAsync(
-      'git symbolic-ref --quiet --short refs/remotes/origin/HEAD',
+    const { stdout } = await commandRunner.execFile(
+      'git', ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'],
       projectPath,
     );
     const remoteDefault = stdout.trim();
     if (remoteDefault) {
-      await commandRunner.execAsync(
-        `git rev-parse --verify ${escapeShellArg(`${remoteDefault}^{commit}`)}`,
+      await commandRunner.execFile(
+        'git', ['rev-parse', '--verify', '--end-of-options', `${remoteDefault}^{commit}`],
         projectPath,
       );
       return remoteDefault;
@@ -176,8 +177,8 @@ export async function resolveDefaultWorktreeBase(
 
   for (const candidate of ['origin/main', 'origin/master', 'main', 'master']) {
     try {
-      await commandRunner.execAsync(
-        `git rev-parse --verify ${escapeShellArg(`${candidate}^{commit}`)}`,
+      await commandRunner.execFile(
+        'git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
         projectPath,
       );
       return candidate;
@@ -229,6 +230,11 @@ export async function assertNewBranchName(
 
 export class WorktreeManager {
   private projectsCache: Map<string, { baseDir: string }> = new Map();
+  private archivePathGuard?: (target: string) => Promise<void>;
+
+  setArchivePathGuard(guard: (target: string) => Promise<void>): void {
+    this.archivePathGuard = guard;
+  }
 
   constructor(
     private configManager?: ConfigManager,
@@ -272,19 +278,20 @@ export class WorktreeManager {
   }
 
   async createWorktree(projectPath: string, name: string, branch: string | undefined, baseBranch: string | undefined, worktreeFolder: string | undefined, pathResolver: PathResolver, commandRunner: CommandRunner): Promise<{ worktreePath: string; baseCommit: string; baseBranch: string }> {
-    return await withLock(`worktree-create-${projectPath}-${name}`, async () => {
+    return await withArchiveRepositoryLock(projectPath, commandRunner, () => withLock(`worktree-create-${projectPath}-${name}`, async () => {
 
       const worktreePath = this.getWorktreePath(projectPath, name, worktreeFolder, pathResolver);
+      await this.archivePathGuard?.(pathResolver.toFileSystem(worktreePath));
       const branchName = branch || name;
     
 
     try {
       // First check if this is a git repository
       try {
-        await commandRunner.execAsync(`git rev-parse --is-inside-work-tree`, projectPath);
+        await commandRunner.execFile('git', ['rev-parse', '--is-inside-work-tree'], projectPath);
       } catch {
         // Initialize git repository
-        await commandRunner.execAsync(`git init`, projectPath);
+        await commandRunner.execFile('git', ['init'], projectPath);
       }
 
       // Clean up any existing worktree directory first
@@ -327,12 +334,12 @@ export class WorktreeManager {
 
       // Check if the repository has any commits
       try {
-        await commandRunner.execAsync(`git rev-parse HEAD`, projectPath);
+        await commandRunner.execFile('git', ['rev-parse', 'HEAD'], projectPath);
       } catch {
         // Repository has no commits yet, create initial commit
         // Use cross-platform approach without shell operators
         try {
-          await commandRunner.execAsync(`git add -A`, projectPath);
+          await commandRunner.execFile('git', ['add', '-A'], projectPath);
         } catch {
           // Ignore add errors (no files to add)
         }
@@ -342,10 +349,9 @@ export class WorktreeManager {
       await ensureFastGitConfig(projectPath, commandRunner);
 
       // Check if branch already exists
-      const checkBranchCmd = `git show-ref --verify --quiet refs/heads/${branchName}`;
       let branchExists = false;
       try {
-        await commandRunner.execAsync(checkBranchCmd, projectPath);
+        await commandRunner.execFile('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], projectPath);
         branchExists = true;
       } catch {
         // Branch doesn't exist, will create it
@@ -357,40 +363,31 @@ export class WorktreeManager {
 
       if (branchExists) {
         // Use existing branch
-        await commandRunner.execAsync(`git worktree add "${worktreePath}" ${branchName}`, projectPath, { timeout: 60000 });
+        await commandRunner.execFile('git', ['worktree', 'add', '--', worktreePath, branchName], projectPath, { timeout: 60000 });
 
         // Get the commit this branch is based on
-        baseCommit = (await commandRunner.execAsync(`git rev-parse ${branchName}`, projectPath)).stdout.trim();
+        baseCommit = (await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', branchName], projectPath)).stdout.trim();
         actualBaseBranch = branchName;
       } else {
         // Create new branch from specified base branch (or current HEAD if not specified)
         const baseRef = baseBranch || 'HEAD';
         actualBaseBranch = baseBranch || 'HEAD';
 
-        // Check if baseBranch is a remote branch (e.g., origin/main)
-        const isRemoteBranch = baseBranch && baseBranch.startsWith('origin/');
-
         // Verify that the base branch exists if specified
         if (baseBranch) {
           try {
             // Use git rev-parse which works for both local and remote refs
-            await commandRunner.execAsync(`git rev-parse --verify ${baseBranch}`, projectPath);
+            await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', baseBranch], projectPath);
           } catch {
             throw new Error(`Base branch '${baseBranch}' does not exist`);
           }
         }
 
         // Capture the base commit before creating the worktree
-        baseCommit = (await commandRunner.execAsync(`git rev-parse ${baseRef}`, projectPath)).stdout.trim();
+        baseCommit = (await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', baseRef], projectPath)).stdout.trim();
 
-        if (isRemoteBranch) {
-          // Keep the remote base for Pane comparisons, but leave upstream unset
-          // so first push creates origin/<branchName> instead of pushing to the base.
-          await commandRunner.execAsync(`git worktree add -b ${branchName} --no-track "${worktreePath}" ${baseBranch}`, projectPath, { timeout: 60000 });
-        } else {
-          // Existing logic for local branches (no tracking)
-          await commandRunner.execAsync(`git worktree add -b ${branchName} "${worktreePath}" ${baseRef}`, projectPath, { timeout: 60000 });
-        }
+        // A workspace branch must not inherit the base branch's upstream.
+        await commandRunner.execFile('git', ['worktree', 'add', '-b', branchName, '--no-track', '--', worktreePath, baseRef], projectPath, { timeout: 60000 });
       }
       
       console.log(`[WorktreeManager] Worktree created successfully at: ${worktreePath}`);
@@ -407,7 +404,7 @@ export class WorktreeManager {
         console.error(`[WorktreeManager] Failed to create worktree:`, error);
         throw new Error(`Failed to create worktree: ${error instanceof Error ? error.message : String(error)}`);
       }
-    });
+    }));
   }
 
   /**
@@ -441,15 +438,19 @@ export class WorktreeManager {
       // Try claiming a pre-created reserve worktree for instant creation
       try {
         const branchName = requestedBranch ?? worktreeName;
-        const claimed = await worktreePoolManager.claimReserve(
-          projectPath,
-          effectiveBase,
-          worktreeName,
-          branchName,
-          worktreeFolder,
-          pathResolver,
-          commandRunner
-        );
+        const claimed = await withArchiveRepositoryLock(projectPath, commandRunner, async () => {
+          const target = this.getWorktreePath(projectPath, worktreeName, worktreeFolder, pathResolver);
+          await this.archivePathGuard?.(pathResolver.toFileSystem(target));
+          return worktreePoolManager.claimReserve(
+            projectPath,
+            effectiveBase,
+            worktreeName,
+            branchName,
+            worktreeFolder,
+            pathResolver,
+            commandRunner
+          );
+        });
         if (claimed) {
           // Detect base commit from the claimed worktree
           const { baseCommit } = await detectGitBase(claimed.worktreePath, commandRunner);
@@ -487,7 +488,8 @@ export class WorktreeManager {
    * stored path rather than a name.
    */
   async removeWorktreeAtPath(projectPath: string, worktreePath: string, sessionCreatedAt: Date | undefined, pathResolver: PathResolver, commandRunner: CommandRunner, auditContext?: WorktreeAuditContext): Promise<WorktreeTrashDeletion> {
-    return await withLock(`worktree-remove-${projectPath}-${worktreePath}`, async () => {
+    return await withArchiveRepositoryLock(projectPath, commandRunner, () => withLock(`worktree-remove-${projectPath}-${worktreePath}`, async () => {
+      await this.archivePathGuard?.(pathResolver.toFileSystem(worktreePath));
       const auditDetails = {
         source: auditContext?.source,
         sessionId: auditContext?.sessionId,
@@ -535,7 +537,7 @@ export class WorktreeManager {
         // For other errors, still throw
         throw new Error(`Failed to remove worktree: ${errorMessage}`);
       }
-    });
+    }));
   }
 
   async listWorktrees(projectPath: string, commandRunner: CommandRunner): Promise<WorktreeEntry[]> {
@@ -812,7 +814,7 @@ export class WorktreeManager {
       // Use cross-platform approach
       let stdout = '0';
       try {
-        const result = await commandRunner.execAsync(`git rev-list --count HEAD..${mainBranch}`, worktreePath);
+        const result = await commandRunner.execFile('git', ['rev-list', '--count', `HEAD..${mainBranch}`, '--'], worktreePath);
         stdout = result.stdout;
       } catch {
         // Error checking, assume no changes
@@ -1395,8 +1397,8 @@ export class WorktreeManager {
 
   async gitSoftReset(worktreePath: string, mainBranch: string, commandRunner: CommandRunner): Promise<{ output: string; previousCommitMessage: string }> {
     // Live safety check — count commits ahead of main branch
-    const { stdout: aheadOutput } = await commandRunner.execAsync(
-      `git log --oneline HEAD ^${escapeShellArg(mainBranch)}`,
+    const { stdout: aheadOutput } = await commandRunner.execFile(
+      'git', ['log', '--oneline', 'HEAD', `^${mainBranch}`, '--'],
       worktreePath,
       { timeout: 30000 }
     );
@@ -1406,15 +1408,15 @@ export class WorktreeManager {
     }
 
     // Capture current HEAD commit message before resetting
-    const { stdout: commitMessage } = await commandRunner.execAsync(
-      'git log -1 --pretty=%B',
+    const { stdout: commitMessage } = await commandRunner.execFile(
+      'git', ['log', '-1', '--pretty=%B'],
       worktreePath,
       { timeout: 10000 }
     );
 
     // Perform soft reset
-    const { stdout: output } = await commandRunner.execAsync(
-      'git reset --soft HEAD~1',
+    const { stdout: output } = await commandRunner.execFile(
+      'git', ['reset', '--soft', 'HEAD~1'],
       worktreePath,
       { timeout: 30000 }
     );
@@ -1427,9 +1429,7 @@ export class WorktreeManager {
 
   async setUpstream(worktreePath: string, remoteBranch: string, commandRunner: CommandRunner): Promise<{ output: string }> {
     try {
-      // Escape the remote branch name to prevent shell injection
-      const escapedBranch = escapeShellArg(remoteBranch);
-      const { stdout, stderr } = await commandRunner.execAsync(`git branch --set-upstream-to=${escapedBranch}`, worktreePath);
+      const { stdout, stderr } = await commandRunner.execFile('git', ['branch', `--set-upstream-to=${remoteBranch}`], worktreePath);
       const output = stdout || stderr || `Tracking set to ${remoteBranch}`;
       return { output };
     } catch (error: unknown) {
@@ -1539,7 +1539,7 @@ export class WorktreeManager {
 
   async getOriginBranch(worktreePath: string, branch: string, commandRunner: CommandRunner): Promise<string | null> {
     try {
-      await commandRunner.execAsync(`git rev-parse --verify origin/${branch}`, worktreePath);
+      await commandRunner.execFile('git', ['rev-parse', '--verify', '--end-of-options', `origin/${branch}`], worktreePath);
       return `origin/${branch}`;
     } catch {
       return null;

@@ -37,7 +37,8 @@ body {
 /*
  * App chrome behaves like a native window: labels and controls are not
  * drag-selectable, the cursor stays an arrow (Tailwind's preflight gives every
- * button a hand), and nothing rubber-bands or chains scroll to the page.
+ * button a hand), and the window does not rubber-band. Nested scroll areas
+ * still hand leftover scroll to their parent, so the rule stays on the root.
  * Content that people copy opts back in below or with `select-text`.
  */
 body {
@@ -45,7 +46,8 @@ body {
   cursor: default;
 }
 
-* {
+html,
+body {
   overscroll-behavior: none;
 }
 
@@ -194,32 +196,37 @@ body.understory {
 }
 
 /* Tab indicator — default fill mode */
-.panel-tab-bar [aria-selected="true"] {
-  background-color: var(--color-surface-hover);
+.panel-tab-strip [aria-selected="true"] {
+  background-color: var(--color-bg-primary);
+}
+
+:root.haar .panel-tab-strip [aria-selected="true"] {
+  background-color: var(--color-bg-editor);
 }
 
 /* Tab indicator — Forge underline mode */
-:root.forge .panel-tab-bar [aria-selected="true"],
-:root.ember .panel-tab-bar [aria-selected="true"],
-:root.night-owl .panel-tab-bar [aria-selected="true"],
-:root.night-owl-oled .panel-tab-bar [aria-selected="true"],
-:root.terracotta .panel-tab-bar [aria-selected="true"],
-:root.synthwave .panel-tab-bar [aria-selected="true"],
-:root.acid .panel-tab-bar [aria-selected="true"],
-:root.tokyo-rain .panel-tab-bar [aria-selected="true"],
-:root.folio .panel-tab-bar [aria-selected="true"],
-:root.newsprint .panel-tab-bar [aria-selected="true"],
-:root.walnut .panel-tab-bar [aria-selected="true"],
-:root.amber-crt .panel-tab-bar [aria-selected="true"],
-:root.teletype .panel-tab-bar [aria-selected="true"],
-:root.dot-matrix .panel-tab-bar [aria-selected="true"],
-:root.abyss .panel-tab-bar [aria-selected="true"],
-:root.understory .panel-tab-bar [aria-selected="true"],
-:root.colorblind-safe .panel-tab-bar [aria-selected="true"],
-:root.low-fatigue .panel-tab-bar [aria-selected="true"],
-:root.high-legibility .panel-tab-bar [aria-selected="true"] {
+:root.forge .panel-tab-strip [aria-selected="true"],
+:root.ember .panel-tab-strip [aria-selected="true"],
+:root.night-owl .panel-tab-strip [aria-selected="true"],
+:root.night-owl-oled .panel-tab-strip [aria-selected="true"],
+:root.terracotta .panel-tab-strip [aria-selected="true"],
+:root.synthwave .panel-tab-strip [aria-selected="true"],
+:root.acid .panel-tab-strip [aria-selected="true"],
+:root.tokyo-rain .panel-tab-strip [aria-selected="true"],
+:root.folio .panel-tab-strip [aria-selected="true"],
+:root.newsprint .panel-tab-strip [aria-selected="true"],
+:root.walnut .panel-tab-strip [aria-selected="true"],
+:root.amber-crt .panel-tab-strip [aria-selected="true"],
+:root.teletype .panel-tab-strip [aria-selected="true"],
+:root.dot-matrix .panel-tab-strip [aria-selected="true"],
+:root.abyss .panel-tab-strip [aria-selected="true"],
+:root.understory .panel-tab-strip [aria-selected="true"],
+:root.colorblind-safe .panel-tab-strip [aria-selected="true"],
+:root.low-fatigue .panel-tab-strip [aria-selected="true"],
+:root.high-legibility .panel-tab-strip [aria-selected="true"] {
   background-color: transparent;
-  box-shadow: inset 0 calc(-1 * var(--tab-indicator-height, 4px)) 0 0 var(--tab-indicator-color, #3574F0);
+  box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000),
+    inset 0 calc(-1 * var(--tab-indicator-height, 4px)) 0 0 var(--tab-indicator-color, #3574F0);
 }
 
 /* Theme-aware structural shells.
@@ -306,10 +313,58 @@ body.understory {
    shadows. Theme personality lives in colour tokens, not in the frame. */
 .pane-sidebar-shell {
   border-right: var(--border-hairline) solid var(--color-border-primary);
+  user-select: none;
+}
+
+.pane-sidebar-shell :is(input, textarea, [contenteditable="true"]) {
+  user-select: text;
+}
+
+/* Both section actions remain reachable: Sessions pins above Projects, which
+   rests at the bottom until its rows reach the viewport. The groups use
+   display: contents so sticky headers share the list's containing block.
+   Reserve the covered space when keyboard focus scrolls a row into view. */
+.pane-sidebar-list {
+  --sidebar-section-height: 2rem;
+  scroll-padding-block: calc(2 * var(--sidebar-section-height) + 0.25rem) calc(var(--sidebar-section-height) + 0.25rem);
+}
+
+.pane-sidebar-shell-collapsed .pane-sidebar-list {
+  --sidebar-section-height: 2.5rem;
+}
+
+.pane-sidebar-projects-header {
+  top: 0;
+}
+
+.pane-sidebar-list:has(.pane-sidebar-sessions-header) .pane-sidebar-projects-header {
+  top: var(--sidebar-section-height);
+}
+
+/* Sidebar selection is indicated by row shading, so a pointer press leaves no
+   ring. Keyboard focus keeps one: the rows and their Archive and Pin buttons are
+   only reachable without a mouse. The ring is inset so dense rows never clip it. */
+.pane-sidebar-shell :is(button, a, [role="button"]):focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+
+.pane-sidebar-shell :is(button, a, [role="button"]):focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
 }
 
 .panel-tab-bar {
   border-bottom: var(--border-hairline) solid var(--color-border-primary);
+}
+
+.pane-drag-area {
+  -webkit-app-region: drag;
+}
+
+.pane-window-title-bar :is(button, [role="button"]) {
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
 }
 
 /* Hide scrollbar completely */
@@ -1151,21 +1206,23 @@ body.understory {
   grid-template-columns: 16px minmax(0, 1fr) auto 18px;
   align-items: center;
   column-gap: 6px;
-  height: 32px;
-  padding: 0 10px 0 8px;
+  height: 28px;
+  margin: 2px 8px;
+  padding: 0 8px;
+  border-radius: 6px;
   color: var(--color-text-primary);
   cursor: default;
 }
 .pane-changes-list-row:hover { background: var(--color-surface-hover); }
+.pane-changes-list-row.is-active { background: var(--color-surface-hover); }
 .pane-changes-list-row.is-selected { background: var(--color-surface-selected); }
-.pane-changes-list-row.is-active { box-shadow: inset 0 0 0 2px var(--color-interactive); }
 
 /* The dir prefix absorbs all truncation; the basename always renders in full. */
 .pane-changes-list-path {
   display: flex;
   align-items: baseline;
   min-width: 0;
-  font-size: 13px;
+  font-size: 12px;
   font-family: theme('fontFamily.mono');
 }
 .pane-changes-list-dir {
@@ -1174,12 +1231,12 @@ body.understory {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--color-text-muted);
+  color: var(--color-text-secondary);
 }
 .pane-changes-list-name { flex: 0 0 auto; white-space: nowrap; color: var(--color-text-primary); }
 
-.pane-changes-list-stats { color: var(--color-text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.pane-changes-list-status { color: var(--color-text-secondary); font-size: 11px; font-weight: 600; }
+.pane-changes-list-stats { color: var(--color-text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pane-changes-list-status { color: var(--color-text-secondary); font-size: 10px; font-weight: 600; }
 
 @container (max-width: 320px) {
   .pane-changes-list-stats { display: none; }

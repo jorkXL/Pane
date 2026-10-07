@@ -9,14 +9,18 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { boundary, decodeBoundary } from '../../shared/validation/boundaryDecoder';
 import type { PaneEventArgument } from './core/eventSink';
-import { customCommandResumeSchema } from '../../shared/types/customCommandResume';
 
 const launchHeadlessDaemon = hasHeadlessDaemonLaunchArg();
 const launchRemoteSetup = hasRemoteSetupLaunchArg();
 
 // Fix GTK 2/3 and GTK 4 conflict on Linux (Electron 36 issue)
 // This MUST be done before importing electron
-import { app } from 'electron';
+import { app, protocol } from 'electron';
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'pane-media',
+  privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true, corsEnabled: true },
+}]);
 
 if (process.platform === 'darwin') {
   // Work around unrecoverable Skia Graphite rendering glitches on macOS.
@@ -67,7 +71,6 @@ import { autoUpdater as nativeAutoUpdater, BrowserWindow, ipcMain, screen, shell
 import * as path from 'path';
 import * as os from 'os';
 import type { SessionManager } from './services/sessionManager';
-import { isCliAgentType, resolveAgentTypeFromCommand } from './services/agents/agentIdentity';
 import type { ConfigManager } from './services/configManager';
 import { areKeyboardShortcutsEnabled, shouldForwardCommandPaletteShortcut } from './utils/keyboardShortcuts';
 import {
@@ -104,15 +107,17 @@ import type { CliManagerFactory } from './services/cliManagerFactory';
 import { setupConsoleWrapper } from './utils/consoleWrapper';
 import * as fs from 'fs';
 import { terminalPanelManager } from './services/terminalPanelManager';
+import { markTerminalPanelsInterrupted } from './services/terminalShutdown';
 import { panelManager } from './services/panelManager';
 import { worktreePoolManager } from './services/worktreePoolManager';
 import { usageManager } from './services/usage/usageManager';
+import { SharedCredentialSync } from './services/sharedCredentialSync';
 import { LeaderboardService } from './services/leaderboardService';
 import { registerLeaderboardHandlers } from './ipc/leaderboard';
 import { PtyHostSupervisor } from './ptyHost/ptyHostSupervisor';
 import { syncAutoStartOnBoot } from './utils/autoStart';
 import { syncPaneMcpForApp } from './services/paneMcpRegistration';
-import { findPaneLinkArg, forwardPaneLinkToRunningPane, OPEN_PANE_LINK_CHANNEL, PANE_LINK_SCHEME } from './services/paneLinks';
+import { findPaneLinkArg, forwardPaneLinkToRunningPane, OPEN_PANE_LINK_CHANNEL, PANE_LINK_SCHEME, parsePaneLink } from './services/paneLinks';
 import { createPaneDaemonHost, type PaneDaemonHost } from './daemon/bootstrap';
 import { remotePaneClientController } from './daemon/client/remotePaneClient';
 import { startHeadlessPaneProcess } from './daemon/startHeadless';
@@ -228,6 +233,7 @@ function setAppTitle() {
 }
 // Service instances (configManager exported for shell preference access)
 export let configManager: ConfigManager;
+let sharedCredentialSync: SharedCredentialSync | null = null;
 let logger: Logger;
 export let sessionManager: SessionManager;
 let worktreeManager: WorktreeManager;
@@ -239,6 +245,11 @@ let versionChecker: VersionChecker;
 let archiveProgressManager: ArchiveProgressManager;
 let leaderboardService: LeaderboardService;
 let analyticsManager: AnalyticsManager;
+// Observing preserves Node/Electron's existing fatal exception behavior.
+// Fatal unhandled rejections also reach this monitor under Node's default mode.
+process.on('uncaughtExceptionMonitor', (error) => {
+  analyticsManager?.captureException(error, 'main-uncaught');
+});
 let paneDaemonHost: PaneDaemonHost | null = null;
 let pendingPaneLink: string | undefined;
 let paneLinksReady = false;
@@ -249,6 +260,17 @@ function openPaneLink(link: string): void {
     return;
   }
   pendingPaneLink = undefined;
+  if (remotePaneClientController.isRemoteModeActive()) {
+    // The link names the active host's Panes, which only the renderer holds in remote mode.
+    try {
+      const target = parsePaneLink(link);
+      showMainWindow();
+      mainWindow?.webContents.send('pane:open-link', target);
+    } catch (error) {
+      console.warn('[Main] Could not open pane link:', error);
+    }
+    return;
+  }
   void paneDaemonHost.commandRegistry.invoke(OPEN_PANE_LINK_CHANNEL, [link]).then((result) => {
     console.log('[Main] Opened pane link:', JSON.stringify(result));
   }).catch((error) => console.warn('[Main] Could not open pane link:', error));
@@ -1060,6 +1082,9 @@ async function createWindow() {
   // Handle renderer process crashes with recovery
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[RendererLifecycle] render-process-gone:', details.reason, details);
+    if (details.reason === 'crashed' || details.reason === 'oom') {
+      analyticsManager?.captureException(undefined, details.reason === 'oom' ? 'renderer-oom' : 'renderer-crash');
+    }
     if (details.reason === 'crashed' || details.reason === 'oom' || details.reason === 'killed') {
       // Attempt to reload the renderer
       console.log('[Main] Attempting to recover renderer...');
@@ -1246,6 +1271,14 @@ async function initializeServices() {
 
   ipcMain.handle('diagnostics:renderer-fatal', (_event, payload: RendererDiagnosticPayload) => {
     logger.error(`[RendererFatal] ${formatRendererDiagnostic(payload || {})}`);
+    const error = new Error();
+    error.stack = payload?.stack;
+    // The first line is used only to classify built-in types, never transmitted.
+    const name = error.stack?.split(':', 1)[0];
+    if (name) error.name = name;
+    const source = payload?.kind === 'error-boundary' ? 'react-boundary'
+      : payload?.kind === 'unhandledrejection' ? 'renderer-rejection' : 'renderer-error';
+    analyticsManager.captureException(error, source);
     return { success: true };
   });
 }
@@ -1476,6 +1509,10 @@ if (launchRemoteSetup) {
     }
   }, 5000); // Delay to not slow down app startup
 
+  // Share integration keys with the hosts this desktop has paired with.
+  sharedCredentialSync = new SharedCredentialSync(configManager);
+  sharedCredentialSync.start();
+
   // Index agent CLI transcripts for the usage page. Read-only, and deferred so
   // a first pass over a large ~/.claude never delays window creation.
   setTimeout(() => {
@@ -1517,6 +1554,7 @@ if (launchRemoteSetup) {
   logToFile('before-quit fired');
 
   usageManager.stop();
+  void sharedCredentialSync?.stop();
 
   // Guard against multiple shutdown attempts
   if (shutdownInProgress) {
@@ -1615,34 +1653,18 @@ if (launchRemoteSetup) {
     console.log('[Main] Saving terminal states...');
     await terminalPanelManager.saveAllTerminalStates();
 
-    const interruptedPanels = new Map<string, string[]>(); // sessionId → panelIds
-
-    // Find all terminal panels running supported CLI agents and mark them as interrupted
+    // Find all terminal panels running supported CLI agents and mark them as interrupted.
+    // Each panel is decoded independently so malformed legacy state cannot abort cleanup.
     const allTerminalPanelIds = terminalPanelManager.getAllPanelIds();
-    for (const panelId of allTerminalPanelIds) {
-      const panel = panelManager.getPanel(panelId);
-      if (!panel) continue;
-
-      const customState = decodeBoundary(panel.state?.customState ?? {}, boundary.jsonObject);
-      const resumeState = decodeBoundary(customState, boundary.object({
-        agentType: boundary.optional(boundary.enumeration('claude', 'codex', 'cursor')),
-        initialCommand: boundary.optional(boundary.string),
-        customResume: boundary.optional(boundary.nullable(customCommandResumeSchema)),
-      }));
-      const agentType = resumeState.agentType ?? resolveAgentTypeFromCommand(resumeState.initialCommand);
-
-      if (isCliAgentType(agentType) || resumeState.customResume) {
-        panel.state.customState = { ...customState, wasInterrupted: true, agentType };
-        await panelManager.updatePanel(panelId, { state: panel.state });
-
-        const existing = interruptedPanels.get(panel.sessionId);
-        if (existing) {
-          existing.push(panelId);
-        } else {
-          interruptedPanels.set(panel.sessionId, [panelId]);
-        }
+    const interruptedPanels = await markTerminalPanelsInterrupted(
+      allTerminalPanelIds,
+      panelId => panelManager.getPanel(panelId),
+      (panelId, updates) => panelManager.updatePanel(panelId, updates),
+    );
+    for (const panelIds of interruptedPanels.values()) {
+      for (const panelId of panelIds) {
         logToFile(`Marked terminal panel ${panelId} as interrupted`);
-        console.log(`[Main] Marked terminal panel ${panelId} as interrupted (${agentType} CLI)`);
+        console.log(`[Main] Marked terminal panel ${panelId} as interrupted`);
       }
     }
 
@@ -1723,6 +1745,7 @@ if (launchRemoteSetup) {
   } catch (error) {
     logToFile(`ERROR during shutdown: ${error}`);
     console.error('[Main] Error during graceful shutdown:', error);
+    analyticsManager?.captureException(error, 'shutdown');
   } finally {
     clearTimeout(shutdownSafetyTimeout);
 

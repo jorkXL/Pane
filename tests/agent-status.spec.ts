@@ -44,7 +44,7 @@ test('sidebar and tabs reconcile status without announcing snapshot completions'
     let snapshotState: AgentState = 'working';
     const statuses = new Set<(data: PanelAgentStatusEvent) => void>();
     const deletions = new Set<(data: { panelId: string; sessionId: string }) => void>();
-    const reconnects = new Set<() => void>();
+    const reconnects = new Set<(event: { hostChanged: boolean }) => void>();
     api.invoke = (channel: string, ...args: unknown[]) => {
       if (channel === 'panels:agent-statuses') return Promise.resolve({ success: true, data: [
         { sessionId: 'Agent pane', panelId: 'agent', state: snapshotState },
@@ -59,7 +59,7 @@ test('sidebar and tabs reconcile status without announcing snapshot completions'
       if (key === 'onPanelDeleted') return (callback: (data: { panelId: string; sessionId: string }) => void) => {
         deletions.add(callback); return () => deletions.delete(callback);
       };
-      if (key === 'onRemoteDaemonResyncRequested') return (callback: () => void) => {
+      if (key === 'onRemoteDaemonResyncRequested') return (callback: (event: { hostChanged: boolean }) => void) => {
         reconnects.add(callback); return () => reconnects.delete(callback);
       };
       return target[key];
@@ -74,7 +74,7 @@ test('sidebar and tabs reconcile status without announcing snapshot completions'
       setSnapshot: state => { snapshotState = state; },
       emit: (state, reason = 'fixture') => { for (const listener of statuses) listener({ panelId: 'agent', sessionId: 'Agent pane', state, reason }); },
       remove: () => { for (const listener of deletions) listener({ panelId: 'agent', sessionId: 'Agent pane' }); },
-      reconnect: () => { for (const listener of reconnects) listener(); },
+      reconnect: () => { for (const listener of reconnects) listener({ hostChanged: false }); },
       notifications,
     };
   });
@@ -85,6 +85,18 @@ test('sidebar and tabs reconcile status without announcing snapshot completions'
   await sidebarPane.click();
   const tab = page.getByRole('tab', { name: 'Codex', exact: true }).locator('..');
   await expect(tab.locator('[aria-label="Agent working"]')).toBeVisible();
+
+  // The compact project's aggregate has its own subscription; it must stay
+  // current across status changes and sidebar unmount/remount.
+  await page.getByRole('button', { name: 'Collapse sidebar', exact: true }).click();
+  const projectBadge = page.getByRole('button', { name: 'Open main workspace for Status fixture', exact: true });
+  await expect(projectBadge.locator('[aria-label="Agent working"]')).toBeVisible();
+  await page.evaluate(() => window.__statusFixture.emit('idle', 'exit'));
+  await expect(projectBadge.locator('[aria-label="Agent idle"]')).toBeVisible();
+  await page.evaluate(() => window.__statusFixture.emit('working'));
+  await expect(projectBadge.locator('[aria-label="Agent working"]')).toBeVisible();
+  await page.getByRole('button', { name: 'Expand sidebar', exact: true }).click();
+  await expect(sidebarPane.locator('..').locator('[aria-label="Agent working"]')).toBeVisible();
 
   await page.evaluate(() => { window.__statusFixture.setSnapshot('idle'); window.__statusFixture.reconnect(); });
   await expect(tab.locator('[aria-label="Agent idle"]')).toBeVisible();

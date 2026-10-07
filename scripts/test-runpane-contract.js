@@ -99,6 +99,14 @@ function checkGeneratedContractFresh() {
   });
 }
 
+function checkContractDocListsEveryCommand() {
+  const doc = fs.readFileSync(path.join(rootDir, 'docs', 'RUNPANE_CLI_CONTRACT.md'), 'utf8');
+  const missing = contract.commands
+    .flatMap((command) => command.usage)
+    .filter((usage) => !doc.includes(usage));
+  assert.deepStrictEqual(missing, [], 'docs/RUNPANE_CLI_CONTRACT.md is missing command usages');
+}
+
 function findPython() {
   for (const command of [process.env.PYTHON, 'python3', 'python'].filter(Boolean)) {
     try {
@@ -410,6 +418,71 @@ function runWatchCli(runtime, args, paneDir, until, timeoutMs = 8_000, extraEnv 
   });
 }
 
+function runCliOnce(runtime, args, paneDir, timeoutMs = 20_000) {
+  const command = runtime === 'npm' ? process.execPath : findPython();
+  const commandArgs = runtime === 'npm' ? [npmCli, ...args] : ['-m', 'runpane', ...args];
+  const env = {
+    ...process.env,
+    PANE_DIR: paneDir,
+    PYTHONDONTWRITEBYTECODE: '1',
+    PYTHONPATH: pythonSource,
+    RUNPANE_TELEMETRY_DISABLED: '1',
+  };
+  delete env.PANE_PANEL_ID;
+  return new Promise((resolve, reject) => {
+    const child = childProcess.spawn(command, commandArgs, { cwd: rootDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`${runtime} ${args.join(' ')} timed out. stdout=${stdout} stderr=${stderr}`));
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+async function checkPanesAdoptCliParity() {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-adopt-'));
+  const args = [
+    'panes', 'adopt', '--repo', 'active', '--path', path.join(paneDir, 'existing-worktree'),
+    '--name', 'adopted', '--agent', 'claude', '--resume', 'agent-session-1', '--folder', 'Imported',
+    '--launch', '--yes', '--json',
+  ];
+  const daemonResult = {
+    ok: true,
+    repo: { id: 1, name: 'Pane', path: '/repo', active: true, sessionCount: 1 },
+    items: [{ ok: true, index: 0, name: 'adopted', pinned: true, sessionId: 'session-1' }],
+  };
+  const frames = {};
+  try {
+    for (const runtime of ['npm', 'pip']) {
+      const run = await withFakeDaemon(
+        paneDir,
+        (frame) => {
+          frames[runtime] = frame;
+          return { result: daemonResult };
+        },
+        () => runCliOnce(runtime, args, paneDir),
+      );
+      assert.strictEqual(run.code, 0, `${runtime} panes adopt exited ${run.code}. stdout=${run.stdout} stderr=${run.stderr}`);
+      assert.deepStrictEqual(JSON.parse(run.stdout), daemonResult, `${runtime} panes adopt printed the wrong result`);
+    }
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+  assert.strictEqual(frames.npm.channel, 'runpane:panes:adopt');
+  assert.deepStrictEqual(frames.pip, frames.npm, 'Python and Node panes adopt sent different daemon requests');
+}
+
 async function checkWatchStreamParity() {
   for (const runtime of ['npm', 'pip']) {
     const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), `runpane-watch-${runtime}-`));
@@ -684,223 +757,49 @@ function spawnWatchCli(runtime, args) {
     });
 }
 
+// Python materializes optional defaults while TypeScript leaves them absent.
+// Only these known false/empty defaults may differ in representation. Null and
+// undefined both mean an unset optional value; all populated fields are compared.
+const PARSER_DEFAULT_DIFFERENCES = {
+  waitReady: false, noFocus: false, focus: false, pinned: false, noPinned: false,
+  force: false, follow: false, agentsOnly: false, ackNow: false,
+  includeHeldInput: false, idleBackoff: false, allManaged: false,
+  includeShells: false, noHeldInput: false, selfTest: false, report: false,
+  watchKinds: [], watchPaneIds: [], watchExcludePaneIds: [],
+  asFilePointer: false, interrupt: false, noAssociate: false, removeWorktree: false, merged: false,
+  quiet: false, readOnly: false, launch: false,
+};
+
+function normalizeParsedArgs(value) {
+  if (Array.isArray(value)) return value.map(normalizeParsedArgs);
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Test-only serialization of parser snapshots from both languages, including nested JSON values.
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, item]) => item !== null && item !== undefined)
+    .map(([key, item]) => [key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase()), normalizeParsedArgs(item)]));
+}
+
 function compareParserParity() {
   const { parseRunpaneArgs } = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'commands.js'));
-  const nodeOutput = parserSamples.map((args) => {
-    const parsed = parseRunpaneArgs(args);
-    return {
-      command: parsed.command,
-      helpTopic: parsed.helpTopic ?? null,
-      target: parsed.target,
-      paneVersion: parsed.paneVersion,
-      channel: parsed.channel,
-      format: parsed.format,
-      downloadDir: parsed.downloadDir ?? null,
-      panePath: parsed.panePath ?? null,
-      dryRun: parsed.dryRun,
-      yes: parsed.yes,
-      verbose: parsed.verbose,
-      json: parsed.json,
-      contextCommand: parsed.contextCommand ?? null,
-      paneDir: parsed.paneDir ?? null,
-      repo: parsed.repo ?? null,
-      paneId: parsed.paneId ?? null,
-      panelId: parsed.panelId ?? null,
-      repoPath: parsed.repoPath ?? null,
-      name: parsed.name ?? null,
-      worktreeName: parsed.worktreeName ?? null,
-      branch: parsed.branch ?? null,
-      baseBranch: parsed.baseBranch ?? null,
-      agent: parsed.agent ?? null,
-      toolCommand: parsed.toolCommand ?? null,
-      title: parsed.title ?? null,
-      url: parsed.url ?? null,
-      file: parsed.file ?? null,
-      placement: parsed.placement ?? null,
-      initialInput: parsed.initialInput ?? null,
-      initialInputFile: parsed.initialInputFile ?? null,
-      asFilePointer: parsed.asFilePointer ?? false,
-      panelInput: parsed.panelInput ?? null,
-      panelInputFile: parsed.panelInputFile ?? null,
-      fromJson: parsed.fromJson ?? null,
-      timeoutMs: parsed.timeoutMs ?? null,
-      waitReady: parsed.waitReady ?? false,
-      readyTimeoutMs: parsed.readyTimeoutMs ?? null,
-      concurrency: parsed.concurrency ?? null,
-      limit: parsed.limit ?? null,
-      waitCondition: parsed.waitCondition ?? null,
-      contains: parsed.contains ?? null,
-      intervalMs: parsed.intervalMs ?? null,
-      source: parsed.source ?? null,
-      noFocus: parsed.noFocus ?? false,
-      focus: parsed.focus ?? false,
-      pinned: parsed.pinned ?? false,
-      noPinned: parsed.noPinned ?? false,
-      noAssociate: parsed.noAssociate ?? false,
-      composerStrategy: parsed.composerStrategy ?? null,
-      sessionId: parsed.sessionId ?? null,
-      force: parsed.force ?? false,
-      removeWorktree: parsed.removeWorktree ?? false,
-      merged: parsed.merged ?? false,
-      watchAs: parsed.watchAs ?? null,
-      watchSince: parsed.watchSince ?? null,
-      watchFrom: parsed.watchFrom ?? null,
-      watchKinds: parsed.watchKinds ?? [],
-      watchPaneIds: parsed.watchPaneIds ?? [],
-      sessionId: parsed.sessionId ?? null,
-      watchExcludePaneIds: parsed.watchExcludePaneIds ?? [],
-      nameContains: parsed.nameContains ?? null,
-      follow: parsed.follow ?? false,
-      agentsOnly: parsed.agentsOnly ?? false,
-      ackNow: parsed.ackNow ?? false,
-      includeHeldInput: parsed.includeHeldInput ?? false,
-      watchFormat: parsed.watchFormat ?? null,
-      heartbeatSeconds: parsed.heartbeatSeconds ?? null,
-      idleAfterMs: parsed.idleAfterMs ?? null,
-      settleMs: parsed.settleMs ?? null,
-      blockedSettleMs: parsed.blockedSettleMs ?? null,
-      minIntervalMs: parsed.minIntervalMs ?? null,
-      idleBackoff: parsed.idleBackoff ?? false,
-      allManaged: parsed.allManaged ?? false,
-      includeShells: parsed.includeShells ?? false,
-      noHeldInput: parsed.noHeldInput ?? false,
-      selfTest: parsed.selfTest ?? false,
-      quiet: parsed.quiet ?? false,
-      report: parsed.report ?? false,
-      bodyFile: parsed.bodyFile ?? null,
-      message: parsed.message ?? null,
-      query: parsed.query ?? null,
-      doc: parsed.doc ?? null,
-      url: parsed.url ?? null,
-      folder: parsed.folder ?? null,
-      keys: parsed.keys ?? null,
-      toolsets: parsed.toolsets ?? null,
-      readOnly: parsed.readOnly ?? false,
-      reportState: parsed.reportState ?? null,
-      reportPr: parsed.reportPr ?? null,
-      reportHead: parsed.reportHead ?? null,
-      summary: parsed.summary ?? null,
-      summaryFile: parsed.summaryFile ?? null,
-      question: parsed.question ?? null,
-      lockTtlMs: parsed.lockTtlMs ?? null,
-      lockWaitMs: parsed.lockWaitMs ?? null,
-      note: parsed.note ?? null,
-      remoteSetupArgs: parsed.remoteSetupArgs
-    };
-  });
-
-  const pythonOutput = runPythonSnippet(`
+  const nodeOutput = parserSamples.map((args) => normalizeParsedArgs({
+    ...PARSER_DEFAULT_DIFFERENCES,
+    ...parseRunpaneArgs(args),
+  }));
+  const pythonOutput = JSON.parse(runPythonSnippet(`
+from dataclasses import asdict
 import json
 import sys
 from runpane.cli import parse_args
 
-samples = json.loads(sys.stdin.read())
-normalized = []
-for args in samples:
-    parsed = parse_args(args)
-    normalized.append({
-        "command": parsed.command,
-        "helpTopic": parsed.help_topic,
-        "target": parsed.target,
-        "paneVersion": parsed.pane_version,
-        "channel": parsed.channel,
-        "format": parsed.format,
-        "downloadDir": parsed.download_dir,
-        "panePath": parsed.pane_path,
-        "dryRun": parsed.dry_run,
-        "yes": parsed.yes,
-        "verbose": parsed.verbose,
-        "json": parsed.json,
-        "contextCommand": parsed.context_command,
-        "paneDir": parsed.pane_dir,
-        "repo": parsed.repo,
-        "paneId": parsed.pane_id,
-        "panelId": parsed.panel_id,
-        "repoPath": parsed.repo_path,
-        "name": parsed.name,
-        "worktreeName": parsed.worktree_name,
-        "branch": parsed.branch,
-        "baseBranch": parsed.base_branch,
-        "agent": parsed.agent,
-        "toolCommand": parsed.tool_command,
-        "title": parsed.title,
-        "url": parsed.url,
-        "file": parsed.file,
-        "placement": parsed.placement,
-        "initialInput": parsed.initial_input,
-        "initialInputFile": parsed.initial_input_file,
-        "asFilePointer": parsed.as_file_pointer,
-        "panelInput": parsed.panel_input,
-        "panelInputFile": parsed.panel_input_file,
-        "fromJson": parsed.from_json,
-        "timeoutMs": parsed.timeout_ms,
-        "waitReady": parsed.wait_ready,
-        "readyTimeoutMs": parsed.ready_timeout_ms,
-        "concurrency": parsed.concurrency,
-        "limit": parsed.limit,
-        "waitCondition": parsed.wait_condition,
-        "contains": parsed.contains,
-        "intervalMs": parsed.interval_ms,
-        "source": parsed.source,
-        "noFocus": parsed.no_focus,
-        "focus": parsed.focus,
-        "pinned": parsed.pinned,
-        "noPinned": parsed.no_pinned,
-        "noAssociate": parsed.no_associate,
-        "composerStrategy": parsed.composer_strategy,
-        "sessionId": parsed.session_id,
-        "force": parsed.force,
-        "removeWorktree": parsed.remove_worktree,
-        "merged": parsed.merged,
-        "watchAs": parsed.watch_as,
-        "watchSince": parsed.watch_since,
-        "watchFrom": parsed.watch_from,
-        "watchKinds": parsed.watch_kinds,
-        "watchPaneIds": parsed.watch_pane_ids,
-        "sessionId": parsed.session_id,
-        "watchExcludePaneIds": parsed.watch_exclude_pane_ids,
-        "nameContains": parsed.name_contains,
-        "follow": parsed.follow,
-        "agentsOnly": parsed.agents_only,
-        "ackNow": parsed.ack_now,
-        "includeHeldInput": parsed.include_held_input,
-        "watchFormat": parsed.watch_format,
-        "heartbeatSeconds": parsed.heartbeat_seconds,
-        "idleAfterMs": parsed.idle_after_ms,
-        "settleMs": parsed.settle_ms,
-        "blockedSettleMs": parsed.blocked_settle_ms,
-        "minIntervalMs": parsed.min_interval_ms,
-        "idleBackoff": parsed.idle_backoff,
-        "allManaged": parsed.all_managed,
-        "includeShells": parsed.include_shells,
-        "noHeldInput": parsed.no_held_input,
-        "selfTest": parsed.self_test,
-        "quiet": parsed.quiet,
-        "report": parsed.report,
-        "bodyFile": parsed.body_file,
-        "message": parsed.message,
-        "query": parsed.query,
-        "doc": parsed.doc,
-        "url": parsed.url,
-        "folder": parsed.folder,
-        "keys": parsed.keys,
-        "toolsets": parsed.toolsets,
-        "readOnly": parsed.read_only,
-        "reportState": parsed.report_state,
-        "reportPr": parsed.report_pr,
-        "reportHead": parsed.report_head,
-        "summary": parsed.summary,
-        "summaryFile": parsed.summary_file,
-        "question": parsed.question,
-        "lockTtlMs": parsed.lock_ttl_ms,
-        "lockWaitMs": parsed.lock_wait_ms,
-        "note": parsed.note,
-        "remoteSetupArgs": parsed.remote_setup_args,
-    })
-print(json.dumps(normalized))
-`, JSON.stringify(parserSamples));
+print(json.dumps([asdict(parse_args(args)) for args in json.loads(sys.stdin.read())]))
+`, JSON.stringify(parserSamples))).map(parsed => ({
+    ...PARSER_DEFAULT_DIFFERENCES,
+    ...normalizeParsedArgs(parsed),
+  }));
 
-  assert.deepStrictEqual(JSON.parse(pythonOutput), nodeOutput);
+  parserSamples.forEach((args, index) => {
+    assert.deepStrictEqual(pythonOutput[index], nodeOutput[index], `Parser parity: ${args.join(' ')}`);
+  });
 }
 
 function compareLegacyRemoteDaemonHealthParity() {
@@ -2370,7 +2269,7 @@ async function checkDeliveryParity() {
   assert.strictEqual(printed[2].composer.ghostText, 'merge it');
   assert.deepStrictEqual(printed[3].delivery, queued);
   assert.strictEqual(printed[3].delivered, true);
-  assert.ok(stdout.includes('Delivery: queued (transcript)'), stdout.join('\n'));
+  assert.ok(stdout.includes('Delivery: queued (transcript) — The agent sees this only after its current turn ends. Do not resend.'), stdout.join('\n'));
   assert.ok(stdout.includes('Delivered to panel-1 (queued, from the transcript).'), stdout.join('\n'));
   assert.ok(stdout.includes('  Delivery: taken (argv)'), stdout.join('\n'));
   const screenOut = written.join('');
@@ -2399,7 +2298,7 @@ with contextlib.redirect_stdout(stdout):
 print(json.dumps({"stdout": stdout.getvalue().splitlines()}))
 `);
   const python = JSON.parse(pythonOutput);
-  assert.ok(python.stdout.includes('Delivery: queued (transcript)'), python.stdout.join('\n'));
+  assert.ok(python.stdout.includes('Delivery: queued (transcript) — The agent sees this only after its current turn ends. Do not resend.'), python.stdout.join('\n'));
   assert.ok(python.stdout.includes('Delivery: in-composer (screen)'), python.stdout.join('\n'));
   assert.ok(python.stdout.includes('❯ merge it  ⟨suggestion⟩'), python.stdout.join('\n'));
   assert.ok(python.stdout.includes('  Delivery: taken (argv)'), python.stdout.join('\n'));
@@ -3292,9 +3191,11 @@ function compareAgentContextParity() {
     cwd: rootDir
   }).trim();
 
-  const nodeBrief = JSON.parse(runNode(['agent-context', '--json']));
-  const pyBrief = JSON.parse(runPython(['agent-context', '--json']));
+  // The workspaces block reports live Tailscale and Pane state, which can change between the two runs.
+  const { workspaces: nodeWorkspaces, ...nodeBrief } = JSON.parse(runNode(['agent-context', '--json']));
+  const { workspaces: pyWorkspaces, ...pyBrief } = JSON.parse(runPython(['agent-context', '--json']));
   assert.deepStrictEqual(pyBrief, nodeBrief);
+  for (const workspaces of [nodeWorkspaces, pyWorkspaces]) assert.match(workspaces.lines[0], /^Workspaces: (on|off)/);
   assert.strictEqual(nodeBrief.mode, 'brief');
   assert.ok(nodeBrief.rules.some((rule) => rule.includes('runpane doctor --json')));
   assert.ok(nodeBrief.summary.includes('Pane-managed git worktree'));
@@ -3398,9 +3299,10 @@ function compareAgentContextParity() {
   assertIncludes(runNode(['agent-context']), 'Detailed definitions: runpane agent-context --command <command> [--json]');
   assertIncludes(runPython(['agent-context', '--command', 'panes create']), 'runpane panes create');
 
-  // --pane-dir is accepted and ignored by the offline commands.
-  assert.deepStrictEqual(JSON.parse(runNode(['agent-context', '--json', '--pane-dir', '/tmp/pane'])), nodeBrief);
-  assert.deepStrictEqual(JSON.parse(runPython(['agent-context', '--json', '--pane-dir', '/tmp/pane'])), nodeBrief);
+  // --pane-dir only picks which Pane the workspaces block asks; the rest of the brief is offline.
+  const withoutWorkspaces = ({ workspaces, ...brief }) => brief;
+  assert.deepStrictEqual(withoutWorkspaces(JSON.parse(runNode(['agent-context', '--json', '--pane-dir', '/tmp/pane']))), nodeBrief);
+  assert.deepStrictEqual(withoutWorkspaces(JSON.parse(runPython(['agent-context', '--json', '--pane-dir', '/tmp/pane']))), nodeBrief);
   assertIncludes(runNode(['version', '--pane-dir', '/tmp/pane']), 'runpane');
   assertIncludes(runPython(['version', '--pane-dir', '/tmp/pane']), 'runpane');
 
@@ -3653,7 +3555,7 @@ async function checkAgentTemplateParity() {
   const { runPanesCreate } = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'localControl.js'));
 
   const agents = [...RUNPANE_CONTRACT.enums.agents].sort();
-  assert.deepStrictEqual(agents, ['claude', 'codex', 'cursor']);
+  assert.deepStrictEqual(agents, ['claude', 'codex', 'cursor', 'opencode']);
   for (const agent of RUNPANE_CONTRACT.enums.agents) {
     const template = RUNPANE_CONTRACT.agentTemplates[agent];
     assert.ok(template, `agentTemplates missing entry for ${agent}`);
@@ -3662,6 +3564,7 @@ async function checkAgentTemplateParity() {
     assert.ok(template.description.trim().length > 0, `agentTemplates.${agent}.description is empty`);
   }
   assert.strictEqual(RUNPANE_CONTRACT.agentTemplates.cursor.command, 'cursor-agent --force --trust');
+  assert.strictEqual(RUNPANE_CONTRACT.agentTemplates.opencode.command, 'opencode --auto');
 
   const originalInvokeDaemon = daemonClient.invokeDaemon;
   const originalConsoleLog = console.log;
@@ -3870,6 +3773,8 @@ async function checkCliEventSubscriptions() {
 }
 
 async function checkSessionChildPinDefaults() {
+  const { helpText } = require(path.join(rootDir, 'packages/runpane/dist/commands.js'));
+  assert.match(helpText('panes create'), /Session.*unpinned/);
   const daemonClient = require(path.join(rootDir, 'packages/runpane/dist/daemonClient.js'));
   const { parseRunpaneArgs } = require(path.join(rootDir, 'packages/runpane/dist/commands.js'));
   const { runPanesCreate } = require(path.join(rootDir, 'packages/runpane/dist/localControl.js'));
@@ -3909,6 +3814,185 @@ print(json.dumps([build_pane_create_request(parse_args(base + extra))["panes"][0
   }
 }
 
+async function checkSessionPinCommands() {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-session-pins-'));
+  try {
+    for (const runtime of ['npm', 'pip']) {
+      for (const action of ['pin', 'pin', 'unpin', 'unpin']) {
+        const args = ['sessions', action, '--session', 'coordinator', '--json'];
+        const output = await withFakeDaemon(paneDir, frame => {
+          assert.strictEqual(frame.channel, 'runpane:sessions:update');
+          assert.deepStrictEqual(frame.args, [{ selector: { sessionId: 'coordinator' }, input: { isPinned: action === 'pin' } }]);
+          return { result: { ok: true, session: { id: 'coordinator', name: 'Coordinator', isPinned: action === 'pin', agent: 'codex',
+            internalSessionId: 'owner', panelIds: { claude: 'claude-panel', codex: 'codex-panel', cursor: 'cursor-panel' },
+            goal: '', context: '', decisions: [], blockers: [], nextAction: '', evidence: [], outputs: [], associations: [],
+            activity: [], revision: 1, createdAt: '2026-10-06T03:00:00Z', updatedAt: '2026-10-06T03:00:00Z' } } };
+        }, () => runControlProcess(runtime, runtime === 'npm' ? args : ['-m', 'runpane', ...args], paneDir));
+        assert.strictEqual(JSON.parse(output).session.isPinned, action === 'pin');
+      }
+    }
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+}
+
+async function checkSessionRuntime() {
+  const daemonClient = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'daemonClient.js'));
+  const { parseRunpaneArgs } = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'commands.js'));
+  const { runSessionsCreate } = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'localControl.js'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pane-runtime-contract-'));
+  const file = path.join(directory, 'session.json');
+  const input = { name: 'WSL planning', runtime: 'wsl', wslDistribution: 'Ubuntu-24.04', isPinned: true };
+  fs.writeFileSync(file, JSON.stringify(input));
+  const originalInvoke = daemonClient.invokeDaemon;
+  const originalLog = console.log;
+  let received;
+  daemonClient.invokeDaemon = async (channel, args) => {
+    assert.strictEqual(channel, 'runpane:sessions:create');
+    received = args[0];
+    return { ok: true, session: { ...input, id: 'session', associations: [] } };
+  };
+  console.log = () => {};
+  try {
+    assert.strictEqual(await runSessionsCreate(parseRunpaneArgs(['sessions', 'create', '--from-json', file, '--json'])), 0);
+    assert.strictEqual(received.runtime, 'wsl');
+    assert.strictEqual(received.wslDistribution, 'Ubuntu-24.04');
+    assert.strictEqual(received.isPinned, true);
+  } finally {
+    daemonClient.invokeDaemon = originalInvoke;
+    console.log = originalLog;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function runControlProcess(runtime, args, paneDir) {
+  return new Promise((resolve, reject) => {
+    childProcess.execFile(runtime === 'npm' ? process.execPath : findPython(),
+      runtime === 'npm' ? [npmCli, ...args] : args,
+      {
+        cwd: rootDir, encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, PANE_DIR: paneDir, PYTHONPATH: pythonSource, PYTHONDONTWRITEBYTECODE: '1' },
+      },
+      (error, stdout, stderr) => error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve(stdout.trim()));
+  });
+}
+
+async function checkPythonDaemonTimeouts() {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-timeout-'));
+  try {
+    let requests = 0;
+    const output = await withFakeDaemon(paneDir, () => ({
+      result: { recovered: true }, delayMs: ++requests === 1 ? 250 : 0,
+    }), () => runControlProcess('pip', ['-c', `
+import json
+from runpane.daemon_client import invoke_daemon
+try:
+    invoke_daemon("test:timeout", timeout_ms=50)
+    code = None
+except Exception as error:
+    code = getattr(error, "code", type(error).__name__)
+result = invoke_daemon("test:recovery", timeout_ms=1000)
+print(json.dumps({"code": code, "recovered": result["recovered"]}))
+`], paneDir));
+    assert.deepStrictEqual(JSON.parse(output), { code: 'ERR_RUNPANE_DAEMON_TIMEOUT', recovered: true });
+
+    requests = 0;
+    const follow = await withFakeDaemon(paneDir, () => ({
+      result: watchResult(9), delayMs: ++requests === 1 ? 6500 : 0,
+    }), () => runWatchCli('pip', ['watch', '--follow', '--timeout-ms', '1', '--heartbeat', '0'], paneDir,
+      stdout => stdout.includes('WATCH RECONNECTED gen 9'), 12_000));
+    assertIncludes(follow.stdout, 'WATCH ERROR ERR_RUNPANE_DAEMON_TIMEOUT:');
+    assertIncludes(follow.stdout, 'WATCH RECONNECTED gen 9');
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+}
+
+function checkLeadingDashTextArguments() {
+  const { parseRunpaneArgs } = require(path.join(rootDir, 'packages', 'runpane', 'dist', 'commands.js'));
+  const cases = [
+    ['--text', 'panelInput', 'panel_input'], ['--prompt', 'initialInput', 'initial_input'],
+    ['--initial-input', 'initialInput', 'initial_input'], ['--title', 'title', 'title'],
+    ['--name', 'name', 'name'], ['--name-contains', 'nameContains', 'name_contains'],
+  ];
+  for (const [flag, nodeKey] of cases) {
+    assert.strictEqual(parseRunpaneArgs(['panels', 'submit', flag, '- fix the tests'])[nodeKey], '- fix the tests');
+    assert.strictEqual(parseRunpaneArgs(['panels', 'submit', flag, '--yes'])[nodeKey], '--yes');
+    assert.throws(() => parseRunpaneArgs(['panels', 'submit', flag]), /requires a value/);
+  }
+  assert.throws(() => parseRunpaneArgs(['watch', '--timeout-ms', '--json']), /requires a value/);
+  const python = JSON.parse(runPythonSnippet(`
+import json
+import sys
+from runpane.cli import parse_args
+results = []
+for flag, _node_key, key in json.loads(sys.stdin.read()):
+    results.append([getattr(parse_args(["panels", "submit", flag, value]), key) for value in ["- fix the tests", "--yes"]])
+    try:
+        parse_args(["panels", "submit", flag])
+        raise AssertionError("Missing value was accepted")
+    except ValueError:
+        pass
+try:
+    parse_args(["watch", "--timeout-ms", "--json"])
+    raise AssertionError("Missing timeout was accepted")
+except ValueError:
+    pass
+print(json.dumps(results))
+`, JSON.stringify(cases)));
+  assert.deepStrictEqual(python, cases.map(() => ['- fix the tests', '--yes']));
+}
+
+async function checkDryRunMessages() {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-dry-run-messages-'));
+  try {
+    for (const runtime of ['npm', 'pip']) {
+      for (const command of ['pin', 'unpin', 'create', 'adopt']) {
+        const args = ['panes', command, '--dry-run'];
+        if (command === 'pin' || command === 'unpin') args.push('--pane', 's1');
+        else args.push('--repo', 'active', '--name', 'Work', '--agent', 'codex');
+        if (command === 'adopt') args.push('--path', '/work/tree');
+        const output = await withFakeDaemon(paneDir, () => ({ result: command === 'pin' || command === 'unpin'
+          ? { ok: true, dryRun: true, paneId: 's1', pinned: command === 'pin' }
+          : { ok: true, repo: { id: 1, name: 'Example', path: '/repo', active: true, sessionCount: 0 },
+            items: [{ ok: true, index: 0, name: 'Work', pinned: true }] },
+        }), () => runControlProcess(runtime, runtime === 'npm' ? args : ['-m', 'runpane', ...args], paneDir));
+        assert.strictEqual(output, `Would ${command} ${command === 'pin' || command === 'unpin' ? 's1' : 'Work'}`);
+      }
+      const inputPath = path.join(paneDir, 'create.json');
+      fs.writeFileSync(inputPath, JSON.stringify({ repo: 'active', dryRun: true,
+        panes: [{ name: 'Preview', tool: { agent: 'codex' } }] }));
+      const args = ['panes', 'create', '--from-json', inputPath, '--yes'];
+      const output = await withFakeDaemon(paneDir, () => ({ result: {
+        ok: true, repo: { id: 1, name: 'Example', path: '/repo', active: true, sessionCount: 0 },
+        items: [{ ok: true, index: 0, name: 'Preview', pinned: true }],
+      } }), () => runControlProcess(runtime, runtime === 'npm' ? args : ['-m', 'runpane', ...args], paneDir));
+      assert.strictEqual(output, 'Would create Preview', 'JSON dryRun requests must also print as previews');
+    }
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+}
+
+async function checkPaneCreateResultFields() {
+  const paneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runpane-result-fields-'));
+  const result = {
+    ok: true, repo: { id: 1, name: 'Example', path: '/repo', active: true, sessionCount: 1 },
+    items: [{ ok: true, index: 0, name: 'Work', pinned: false, sessionId: 's1', paneId: 's1', panelId: 'p1',
+      tool: { title: 'Codex', command: 'codex --yolo', agent: 'codex' }, active: false, focused: true }],
+  };
+  try {
+    for (const command of ['create', 'adopt']) {
+      const args = ['panes', command, '--repo', 'active', '--name', 'Work', '--agent', 'codex', '--yes', '--json'];
+      if (command === 'adopt') args.push('--path', '/work/tree');
+      const output = await withFakeDaemon(paneDir, () => ({ result }), () => runControlProcess('npm', args, paneDir));
+      assert.deepStrictEqual(JSON.parse(output), result, `${command} JSON must preserve documented result fields`);
+    }
+  } finally {
+    fs.rmSync(paneDir, { recursive: true, force: true });
+  }
+}
+
 async function runChecks() {
   checkGeneratedContractFresh();
   ensureBuiltCli();
@@ -3917,6 +4001,10 @@ async function runChecks() {
   await checkDoctorExitStatus();
   await checkInstallerFailures();
   await checkCreatePayloadErrorPaths();
+  await checkPaneCreateResultFields();
+  await checkDryRunMessages();
+  checkLeadingDashTextArguments();
+  await checkPythonDaemonTimeouts();
   compareParserParity();
   checkWatchFormatterGoldens();
   await checkWatchStreamParity();
@@ -3952,12 +4040,26 @@ async function runChecks() {
   await checkPaneRenameParity();
   await checkLockParity();
   await checkOverviewReportsAndLocks();
+  await checkSessionRuntime();
+  await checkSessionPinCommands();
+  await checkPanesAdoptCliParity();
+  checkContractDocListsEveryCommand();
   await checkAgentTemplateParity();
   checkHelpOutput();
   compareAgentContextParity();
   await checkNodeReleaseTimeout();
   checkNoArgsAndSetupFallback();
   checkDoctorReportSafety();
+  childProcess.execFileSync(process.execPath, ['--test', path.join(__dirname, 'test-runpane-dispatch.js')], {
+    cwd: rootDir,
+    env: { ...process.env, PYTHON: findPython() },
+    stdio: 'inherit',
+  });
+  childProcess.execFileSync(process.execPath, ['--test', path.join(__dirname, 'test-runpane-python-parity.js')], {
+    cwd: rootDir,
+    env: { ...process.env, PYTHON: findPython() },
+    stdio: 'inherit',
+  });
   console.log('runpane CLI contract checks passed');
 }
 

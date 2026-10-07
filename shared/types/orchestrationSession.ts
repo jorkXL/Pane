@@ -15,6 +15,16 @@ export function isOrchestrationInternalSessionId(sessionId: string): boolean {
   return sessionId === '__pane_chat_session__' || sessionId.startsWith(ORCHESTRATION_SESSION_INTERNAL_ID_PREFIX);
 }
 
+/** Default name for a new Session: "New chat", then "New chat 2", "New chat 3", ... */
+export function nextOrchestrationSessionName(sessions: readonly { name: string }[]): string {
+  const existingNames = new Set(sessions.map(session => session.name.trim().toLocaleLowerCase()));
+  if (!existingNames.has('new chat')) return 'New chat';
+
+  let suffix = 2;
+  while (existingNames.has(`new chat ${suffix}`)) suffix += 1;
+  return `New chat ${suffix}`;
+}
+
 export type OrchestrationSessionStatus = 'working' | 'blocked' | 'idle' | 'unknown' | 'unassociated';
 
 export interface OrchestrationLink {
@@ -63,6 +73,9 @@ export interface OrchestrationActivity {
 }
 
 export interface OrchestrationSessionRecord {
+  /** Omitted in older stores; migrated to the host runtime on read. */
+  runtime?: 'windows' | 'wsl';
+  wslDistribution?: string;
   /** Durable recovery anchor for an in-place conversation transfer. */
   promotedFrom?: { paneId: string; panelId: string };
   id: string;
@@ -166,7 +179,10 @@ export interface OrchestrationSessionOverview {
 }
 
 export interface OrchestrationSessionCreateInput {
+  runtime?: 'windows' | 'wsl';
+  wslDistribution?: string;
   name: string;
+  isPinned?: boolean;
   agent?: PaneChatAgent;
   launchCommand?: string;
   customResume?: CustomCommandResume | null;

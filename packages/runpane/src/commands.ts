@@ -45,6 +45,7 @@ export interface ParsedArgs {
   initialInput?: string;
   initialInputFile?: string;
   asFilePointer?: boolean;
+  interrupt?: boolean;
   panelInput?: string;
   panelInputFile?: string;
   fromJson?: string;
@@ -108,6 +109,19 @@ export interface ParsedArgs {
   lockTtlMs?: number;
   lockWaitMs?: number;
   note?: string;
+  /** `runpane workspace <machine> ...` */
+  workspaceMachine?: string;
+  workspacePath?: string;
+  execCommand?: string[];
+  cwd?: string;
+  /** `runpane handoff <destination...>` */
+  handoffDestination?: string;
+  handoffTemplate?: boolean;
+  handoffNoteFile?: string;
+  handoffMachine?: string;
+  handoffModel?: string;
+  handoffEffort?: string;
+  handoffPush?: boolean;
   remoteSetupArgs: string[];
 }
 
@@ -156,8 +170,19 @@ const DEFAULTS: Omit<ParsedArgs, 'command'> = {
   remoteSetupArgs: []
 };
 
+// `runpane --pane-dir <dir> <command>` puts the global flag before the command;
+// set those tokens aside so the command matches, then parse them with the flags.
+function takeLeadingPaneDir(args: string[]): string[] {
+  const taken: string[] = [];
+  while (args[0] === '--pane-dir' || args[0]?.startsWith('--pane-dir=')) {
+    taken.push(...args.splice(0, args[0] === '--pane-dir' ? 2 : 1));
+  }
+  return taken;
+}
+
 export function parseRunpaneArgs(argv: string[]): ParsedArgs {
   const args = [...argv];
+  const leadingPaneDirArgs = takeLeadingPaneDir(args);
   const first = args[0];
 
   if (!first || first === '-h' || first === '--help') {
@@ -186,12 +211,14 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
     };
   }
 
+  const workspaceMachine = takeWorkspaceMachine(args);
   const matched = matchCommand(args);
   if (!matched) {
     throw new Error(`Unknown command: ${first}\n\n${helpText()}`);
   }
 
   args.splice(0, matched.tokens.length);
+  const workspaceArgs = takeWorkspaceVerbArgs(matched.name, args);
 
   const parsed: ParsedArgs = {
     command: decodeBoundary(matched.name, commandSchema),
@@ -211,6 +238,8 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
     parsed.target = 'client';
   }
 
+  Object.assign(parsed, workspaceArgs, workspaceMachine ? { workspaceMachine } : {});
+  args.unshift(...leadingPaneDirArgs);
   parseFlags(args, parsed);
   if (parsed.command === 'watch' && parsed.follow && parsed.timeoutMs === 0) {
     throw new Error('--timeout-ms must be greater than 0 with --follow.');
@@ -239,6 +268,46 @@ export function parseRunpaneArgs(argv: string[]): ParsedArgs {
   }
   if (parsed.command === 'report') validateReportArgs(parsed);
   return parsed;
+}
+
+const WORKSPACE_VERBS = new Set(['read', 'write', 'exec']);
+
+/** Machine names `runpane workspace <name>` cannot take: they are its own subcommands. */
+const WORKSPACE_SUBCOMMANDS = new Set(
+  RUNPANE_CONTRACT.commands.filter((command) => command.name.startsWith('workspace ')).map((command) => command.name.split(' ')[1]),
+);
+
+/** `workspace <machine> read|write|exec ...` → `workspace read|write|exec ...` plus the machine. */
+function takeWorkspaceMachine(args: string[]): string | undefined {
+  if (args[0] !== 'workspace' || !args[1] || WORKSPACE_SUBCOMMANDS.has(args[1]) || args[1].startsWith('-')) return undefined;
+  if (!WORKSPACE_VERBS.has(args[2] ?? '')) return undefined;
+  return args.splice(1, 1)[0];
+}
+
+/** `--` takes the rest of the line for exec; read and write take one path. */
+function takeWorkspaceVerbArgs(command: string, args: string[]): Pick<ParsedArgs, 'workspacePath' | 'execCommand' | 'handoffDestination'> {
+  if (command === 'handoff') {
+    const words: string[] = [];
+    while (args[0] !== undefined && !args[0].startsWith('-')) words.push(args.shift() ?? '');
+    return words.length ? { handoffDestination: words.join(' ') } : {};
+  }
+  if (command === 'workspace exec') {
+    const separator = args.indexOf('--');
+    return separator === -1 ? {} : { execCommand: args.splice(separator).slice(1) };
+  }
+  if ((command === 'workspace read' || command === 'workspace write') && args[0] && !args[0].startsWith('-')) {
+    return { workspacePath: args.shift() };
+  }
+  return {};
+}
+
+/** `runpane workspace <machine> <command...>` for any command other than read, write, and exec. */
+export function splitWorkspacePassThrough(argv: string[]): { machine: string; command: string[] } | null {
+  const args = [...argv];
+  takeLeadingPaneDir(args);
+  if (args[0] !== 'workspace' || !args[1] || WORKSPACE_SUBCOMMANDS.has(args[1]) || args[1].startsWith('-')) return null;
+  if (!args[2] || WORKSPACE_VERBS.has(args[2])) return null;
+  return { machine: args[1], command: args.slice(2) };
 }
 
 function validateReportArgs(parsed: ParsedArgs): void {
@@ -362,7 +431,7 @@ function parseFlags(rawArgs: string[], parsed: ParsedArgs): void {
   }
 }
 
-function matchCommand(args: string[]): { name: string; tokens: string[] } | undefined {
+export function matchCommand(args: string[]): { name: RunpaneCommand; tokens: string[] } | undefined {
   return COMMAND_MATCHERS.find((command) =>
     command.tokens.every((token, index) => args[index] === token)
   );
@@ -431,6 +500,10 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
     parsed.launch = true;
     return;
   }
+  if (flag === '--interrupt') {
+    parsed.interrupt = true;
+    return;
+  }
   if (flag === '--as-file-pointer') {
     parsed.asFilePointer = true;
     return;
@@ -486,6 +559,14 @@ function parseLocalBooleanFlag(flag: string, parsed: ParsedArgs): void {
     parsed.readOnly = true;
     return;
   }
+  if (flag === '--template') {
+    parsed.handoffTemplate = true;
+    return;
+  }
+  if (flag === '--push') {
+    parsed.handoffPush = true;
+    return;
+  }
 
   throw new Error(`Unknown option for ${parsed.command}: ${flag}`);
 }
@@ -521,6 +602,26 @@ function parseLocalValueFlag(flag: string, value: string, parsed: ParsedArgs): v
   }
   if (flag === '--path') {
     parsed.repoPath = value;
+    return;
+  }
+  if (flag === '--cwd') {
+    parsed.cwd = value;
+    return;
+  }
+  if (flag === '--note-file') {
+    parsed.handoffNoteFile = value;
+    return;
+  }
+  if (flag === '--machine') {
+    parsed.handoffMachine = value;
+    return;
+  }
+  if (flag === '--model') {
+    parsed.handoffModel = value;
+    return;
+  }
+  if (flag === '--effort') {
+    parsed.handoffEffort = value;
     return;
   }
   if (flag === '--url') {
@@ -811,54 +912,10 @@ export function hasCadenceValueFlag(parsed: ParsedArgs): boolean {
   return [parsed.settleMs, parsed.blockedSettleMs, parsed.minIntervalMs].some(value => value !== undefined);
 }
 
+const LOCAL_COMMANDS = new Set<string>(RUNPANE_CONTRACT.commands.filter(command => command.localControl).map(command => command.name));
+
 function isRunpaneLocalCommand(command: RunpaneCommand): boolean {
-  // Every command that maps to a daemon channel takes local flags.
-  if (RUNPANE_CONTRACT.commands.some((entry) => entry.name === command && 'daemonAction' in entry)) return true;
-  return command === 'doctor'
-    || command === 'daemon repair'
-    || command === 'repos list'
-    || command === 'repos add'
-    || command === 'panes list'
-    || command === 'panes cost'
-    || command === 'panes create'
-    || command === 'panes adopt'
-    || command === 'panes archive'
-    || command === 'panes pin'
-    || command === 'panes unpin'
-    || command === 'panes rename'
-    || command === 'panes focus'
-    || command === 'sessions list'
-    || command === 'sessions create'
-    || command === 'sessions get'
-    || command === 'sessions update'
-    || command === 'sessions set-agent'
-    || command === 'sessions associate'
-    || command === 'sessions detach'
-    || command === 'sessions overview'
-    || command === 'lock acquire'
-    || command === 'lock release'
-    || command === 'lock list'
-    || command === 'panels create'
-    || command === 'panels open'
-    || command === 'panels list'
-    || command === 'panels output'
-    || command === 'panels input'
-    || command === 'panels screen'
-    || command === 'panels submit'
-    || command === 'panels submit-composer'
-    || command === 'panels wait'
-    || command === 'panels last-message'
-    || command === 'report'
-    || command === 'workspace state'
-    || command === 'watch'
-    || command === 'agents doctor'
-    || command === 'agents start'
-    || command === 'agents status'
-    || command === 'agents send'
-    || command === 'links create'
-    || command === 'docs search'
-    || command === 'docs read'
-    || command === 'mcp';
+  return LOCAL_COMMANDS.has(command);
 }
 
 function appendRemoteArg(parsed: ParsedArgs, flag: string, value?: string): void {
@@ -915,7 +972,8 @@ function splitInlineValues(rawArgs: string[]): SplitArgs {
 function readValue(args: string[], index: number, flag: string, literalValues: Set<number>): string {
   const value = args[index];
   if (literalValues.has(index)) return value;
-  if (!value || (value.startsWith('-') && value !== '-')) {
+  const freeText = ['--text', '--prompt', '--initial-input', '--title', '--name', '--name-contains'].includes(flag);
+  if (!value || (!freeText && value.startsWith('-') && value !== '-')) {
     throw new Error(`${flag} requires a value.`);
   }
   return value;

@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import path from 'path';
 
 const execFileAsync = promisify(execFile);
 
@@ -106,6 +107,14 @@ export function windowsPathToWSLMount(windowsPath: string): string {
   const match = /^([A-Za-z]):[\\/](.*)$/.exec(windowsPath);
   if (!match) return windowsPath;
   return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, '/')}`;
+}
+
+/** Reverse the default drive-mount mapping used by windowsPathToWSLMount.
+ * Access DrvFs files directly: WSL's UNC server can deny re-exporting drives.
+ */
+export function wslMountToWindowsPath(linuxPath: string): string {
+  const match = /^\/mnt\/([a-z])(?:\/(.*))?$/.exec(path.posix.normalize(linuxPath));
+  return match ? `${match[1].toUpperCase()}:\\${(match[2] ?? '').replace(/\//g, '\\')}` : linuxPath;
 }
 
 /**
@@ -226,6 +235,23 @@ type RunWSL = (args: string[]) => Promise<Buffer>;
 const runWSL: RunWSL = async args =>
   (await execFileAsync('wsl.exe', args, { encoding: 'buffer', timeout: 5000 })).stdout;
 
+export async function listWSLDistributions(run: RunWSL = runWSL): Promise<string[]> {
+  const output = await run(['-l', '-q']);
+  return (output.includes(0) ? output.toString('utf16le') : output.toString('utf8'))
+    .replace(/^\uFEFF/, '').replaceAll('\0', '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+}
+
+/** The distribution `wsl.exe -l -v` marks with "*", or undefined without WSL. */
+export async function getDefaultWSLDistribution(run: RunWSL = runWSL): Promise<string | undefined> {
+  try {
+    const output = await run(['-l', '-v']);
+    const text = (output.includes(0) ? output.toString('utf16le') : output.toString('utf8')).replace(/^\uFEFF/, '').replaceAll('\0', '');
+    return /^\s*\*\s+(\S+)/m.exec(text)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Validate that WSL is available and the specified distro is installed.
  * Returns error message if invalid, null if OK.
@@ -239,15 +265,7 @@ export async function validateWSLAvailable(distro: string, run: RunWSL = runWSL)
 
   let distros: string[];
   try {
-    const output = await run(['-l', '-q']);
-    // wsl.exe writes UTF-16LE unless WSL_UTF8=1 is set, in which case it writes UTF-8.
-    const text = output.includes(0) ? output.toString('utf16le') : output.toString('utf8');
-    distros = text
-      .replace(/^\uFEFF/, '')
-      .replaceAll('\0', '')
-      .split(/\r?\n/)
-      .map(d => d.trim())
-      .filter(Boolean);
+    distros = await listWSLDistributions(run);
   } catch {
     return 'Failed to list WSL distributions.';
   }

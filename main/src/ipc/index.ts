@@ -1,6 +1,7 @@
 import { ipcMain, powerMonitor } from 'electron';
 import type { AppServices } from './types';
 import { registerAppHandlers } from './app';
+import { registerNotesHandlers } from './notes';
 import { registerUpdaterHandlers } from './updater';
 import { registerSessionHandlers } from './session';
 import { registerProjectHandlers } from './project';
@@ -9,6 +10,7 @@ import { registerDialogHandlers } from './dialog';
 import { registerGitHandlers } from './git';
 import { registerScriptHandlers } from './script';
 import { registerPromptHandlers } from './prompt';
+import { registerMediaPreview } from '../services/mediaPreview';
 import { registerFileHandlers } from './file';
 import { registerFolderHandlers } from './folders';
 import { registerUIStateHandlers } from './uiState';
@@ -34,8 +36,10 @@ import { registerPermissionHandlers } from './permissions';
 import { registerAgentUsageHandlers } from './agentUsage';
 import { registerFeedbackHandlers } from './feedback';
 import { registerMobilePushHandlers } from './mobilePush';
+import { registerSharedCredentialHandlers } from './sharedCredentials';
 import { PaneCommandRegistry } from '../daemon/commandRegistry';
 import { registerPaneLinkHandler } from '../services/paneLinks';
+import { getPaneEventSink } from '../core/runtime';
 import { remotePaneClientController } from '../daemon/client/remotePaneClient';
 
 
@@ -62,12 +66,14 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   const bridgeRouter = createDaemonBridgeRouter(commandRegistry);
 
   registerAppHandlers(ipcMain, services);
+  registerNotesHandlers(ipcMain, services);
   registerFeedbackHandlers(ipcMain, services);
   registerUpdaterHandlers(ipcMain, services);
   registerSessionHandlers(ipcMain, services, commandRegistry);
   registerProjectHandlers(ipcMain, services, commandRegistry);
   registerConfigHandlers(ipcMain, services, commandRegistry);
   registerMobilePushHandlers(ipcMain, services, commandRegistry);
+  registerSharedCredentialHandlers(services, commandRegistry);
   registerDialogHandlers(ipcMain, services);
   registerExportHandlers(ipcMain, services);
   registerPermissionHandlers(ipcMain, services, commandRegistry);
@@ -75,6 +81,7 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
   registerScriptHandlers(ipcMain, services, commandRegistry);
   registerPromptHandlers(ipcMain, services, commandRegistry);
   registerFileHandlers(ipcMain, services, commandRegistry);
+  registerMediaPreview(commandRegistry);
   registerFolderHandlers(ipcMain, services, commandRegistry);
   registerUIStateHandlers(services);
   registerDashboardHandlers(ipcMain, services);
@@ -90,11 +97,12 @@ export function registerIpcHandlers(services: AppServices): PaneCommandRegistry 
     repoExists: (repoId) => Boolean(services.databaseService.getProject(repoId)),
     navigate: (target) => {
       const window = services.getMainWindow();
-      if (!window || window.isDestroyed()) throw new Error('Pane window is not available to open the link');
-      if (window.isMinimized()) window.restore();
-      window.show();
-      window.focus();
-      window.webContents.send('pane:open-link', target);
+      if (window && !window.isDestroyed()) {
+        if (window.isMinimized()) window.restore();
+        window.show();
+        window.focus();
+      }
+      getPaneEventSink().send('pane:open-link', target);
     },
   });
   registerClipboardHandlers(ipcMain, services);

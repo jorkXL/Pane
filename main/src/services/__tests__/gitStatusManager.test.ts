@@ -70,7 +70,7 @@ const projectGithubCommand = vi.fn<CommandRunner['execAsync']>();
 const mockProjectContext = {
   project: mockProject,
   pathResolver: {},
-  commandRunner: { execAsync: vi.fn<CommandRunner['execAsync']>(), wslContext: null },
+  commandRunner: { execAsync: vi.fn<CommandRunner['execAsync']>(), execFile: vi.fn<CommandRunner['execFile']>(), wslContext: null },
 };
 
 const cleanIndexStatus: GitIndexStatus = {
@@ -149,6 +149,9 @@ describe('GitStatusManager', () => {
       if (command.startsWith('git ')) return { stdout: projectGitOutput(command, cwd), stderr: '' };
       return projectGithubCommand(command, cwd, options);
     });
+    mockProjectContext.commandRunner.execFile.mockImplementation(async (file, args, cwd) => ({
+      stdout: projectGitOutput([file, ...args].join(' '), cwd), stderr: '', exitCode: 0,
+    }));
     // Git and GitHub CLI outputs have independent fixtures.
     vi.mocked(projectGitOutput).mockReturnValue('');
   });
@@ -178,6 +181,23 @@ describe('GitStatusManager', () => {
       expect(fastCheckWorkingDirectory).not.toHaveBeenCalled();
       expect(projectGitOutput).not.toHaveBeenCalled();
       gitStatusManager.stopPolling();
+    });
+
+    it('settles a refresh that a later refresh superseded during the debounce', async () => {
+      vi.useFakeTimers();
+      try {
+        const superseded = gitStatusManager.refreshSessionGitStatus('test-session');
+        const latest = gitStatusManager.refreshSessionGitStatus('test-session');
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        const [first, second] = await Promise.all([superseded, latest]);
+        expect(first?.state).toBe('clean');
+        expect(second).toBe(first);
+        expect(fastCheckWorkingDirectory).toHaveBeenCalledTimes(1);
+      } finally {
+        gitStatusManager.stopPolling();
+        vi.useRealTimers();
+      }
     });
 
     it('returns clean state when no changes, no ahead/behind, no untracked', async () => {

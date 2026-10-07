@@ -320,6 +320,7 @@ export const PanelTabStrip: React.FC<PanelTabStripProps> = React.memo(({
       ref={stripRef}
       className={cn(
         "flex items-center overflow-x-auto scrollbar-none min-w-0",
+        !compact && "panel-tab-strip",
         // The strip hugs its tabs so the "+" sits right after the last one;
         // while a tab is being dragged it grows to offer the trailing drop zone.
         compact ? "max-w-full" : isTabDragging ? "flex-1" : "flex-initial max-w-full",
@@ -394,7 +395,7 @@ export const PanelTabStrip: React.FC<PanelTabStripProps> = React.memo(({
                     isPermanent ? "px-2" : "px-2 pr-7",
                   )
                 : cn(
-                    "h-[var(--panel-tab-height)]",
+                    'h-[38px]',
                     isCompactTab
                       ? cn("min-w-[5rem] text-xs", isPermanent ? "px-2" : "px-2 pr-8")
                       : cn("min-w-[8rem] text-sm", isPermanent ? "px-3" : "px-3 pr-8"),

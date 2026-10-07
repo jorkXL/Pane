@@ -1,6 +1,8 @@
 import { validateCustomCommandResume, customResumeAgentType, type CustomCommandResume } from '../../../shared/types/customCommandResume';
+import { validateWSLAvailable } from '../utils/wslUtils';
+import { sessionRuntimePath } from './sessionRuntime';
 import { findClaudeSessionTranscript } from './claudeSessionTranscript';
-import { resolveAgentTypeFromCommand } from './agents/agentIdentity';
+import { CLI_AGENT_TYPES, resolveAgentTypeFromCommand } from './agents/agentIdentity';
 import { prepareSessionWorkspace, sessionWorkspacePath, discardSessionScaffold, isPristineSessionWorkspace } from './sessionWorkspace';
 import { DEFAULT_SESSION_PROFILE } from '../../../shared/types/sessionProfile';
 import { EventEmitter } from 'events';
@@ -45,6 +47,7 @@ import {
   DEFAULT_PANE_CHAT_AGENT,
   getPaneChatPanelId,
   normalizePaneChatAgent,
+  PANE_CHAT_AGENT_LABELS,
   PANE_CHAT_SESSION_ID,
   type PaneChatAgent,
 } from '../../../shared/types/paneChat';
@@ -54,21 +57,21 @@ import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDec
 import { OrchestrationSessionStore } from './orchestrationSessionStore';
 import type { WorkspaceSessionMembership } from './workspaceJournal';
 import { readPanelAgentReport } from './agentReport';
+import type { MobileAlertSubject } from '../daemon/mobilePushSender';
 
 const ORCHESTRATION_SESSION_PANEL_PREFIX = '__orchestration_panel_';
 const LEGACY_AGENT_SESSION_ID_PREFIX = `${LEGACY_ORCHESTRATION_SESSION_ID}-`;
 const PANE_CHAT_AGENTS: readonly PaneChatAgent[] = ['claude', 'codex', 'cursor'];
-const PANE_CHAT_AGENT_LABELS = {
-  claude: 'Claude',
-  codex: 'Codex',
-  cursor: 'Cursor',
-} satisfies Record<PaneChatAgent, string>;
 
 const ORCHESTRATION_SESSION_TITLE = 'Session';
 const ORCHESTRATION_BOOTSTRAP_VERSION = 2;
 
 function getOrchestrationPanelId(sessionId: string, agent: PaneChatAgent): string {
   return `${ORCHESTRATION_SESSION_PANEL_PREFIX}${sessionId}_${agent}`;
+}
+
+function isPaneChatAgent(agent: string | undefined): agent is PaneChatAgent {
+  return agent === 'claude' || agent === 'codex' || agent === 'cursor';
 }
 
 export class OrchestrationSessionManager extends EventEmitter {
@@ -145,8 +148,8 @@ export class OrchestrationSessionManager extends EventEmitter {
         internalSession,
         panel,
         agent: record.agent,
-        cwd: sessionWorkspacePath(record.id),
-        guidePath: await this.ensureGuidePath(),
+        cwd: sessionRuntimePath(sessionWorkspacePath(record.id), record),
+        guidePath: sessionRuntimePath(await this.ensureGuidePath(), record),
         started: terminalPanelManager.isTerminalInitialized(panel.id),
       };
     });
@@ -156,6 +159,13 @@ export class OrchestrationSessionManager extends EventEmitter {
     return withLock('orchestration-sessions', async () => {
       await this.ensureInitializedUnlocked();
       validateCreateInput(input);
+      if (input.runtime === 'wsl') {
+        if (process.platform !== 'win32') throw new Error('WSL Sessions require Windows');
+        if (!input.wslDistribution?.trim()) throw new Error('WSL Session requires a distribution');
+        const runtimeError = await validateWSLAvailable(input.wslDistribution);
+        if (runtimeError) throw new Error(runtimeError);
+        if (sourcePanelId) throw new Error('Moving a chat cannot change its runtime');
+      } else if (input.wslDistribution) throw new Error('Windows Session cannot specify a WSL distribution');
       const data = this.store.read();
       const name = input.name.trim();
       if (data.sessions.some(session => normalizeSessionName(session.name) === normalizeSessionName(name))) {
@@ -201,13 +211,15 @@ export class OrchestrationSessionManager extends EventEmitter {
           : fits('', config.defaultSessionResume) ? config.defaultSessionResume : null;
       const agent = resolveSessionAgent(explicitAgent, launchCommand, customResume)
         ?? normalizePaneChatAgent(config.defaultOrchestratorAgent);
-      this.assertAgentSupported(agent);
+      this.assertAgentSupported(agent, input.runtime);
       const record: OrchestrationSessionRecord = {
+        runtime: input.runtime ?? 'windows',
+        wslDistribution: input.wslDistribution,
         id,
         name,
         promotedFrom: sourcePanel && sourcePane ? { paneId: sourcePane.id, panelId: sourcePanel.id } : undefined,
         archived: false,
-        isPinned: false,
+        isPinned: input.isPinned ?? false,
         agent,
         launchCommand,
         customResume,
@@ -249,7 +261,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         }
         this.store.write(next);
       } catch (error) {
-        if (sourcePanel) discardSessionScaffold(record.id);
+        if (sourcePanel) discardSessionScaffold(record);
         throw error;
       }
       try {
@@ -267,7 +279,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         // an unrecoverable duplicate-name orphan.
         const ownerExists = this.sessionManager.getSession(record.internalSessionId) !== undefined;
         const panelExists = panelManager.getPanel(record.panelIds[record.agent]) !== undefined;
-        if (!ownerExists && !panelExists && discardSessionScaffold(record.id)) {
+        if (!ownerExists && !panelExists && discardSessionScaffold(record)) {
           this.store.write(data);
           throw error;
         }
@@ -317,7 +329,7 @@ export class OrchestrationSessionManager extends EventEmitter {
       if (input.name !== undefined && data.sessions.some(session => session.id !== current.id && normalizeSessionName(session.name) === normalizeSessionName(nextRecord.name))) {
         throw new Error(`A Session named ${nextRecord.name} already exists`);
       }
-      this.assertAgentSupported(nextRecord.agent);
+      this.assertAgentSupported(nextRecord.agent, nextRecord.runtime);
       if (nextRecord.archived === true && nextRecord.agent !== current.agent) {
         throw new Error(`Session ${current.name} is archived; restore it before changing its agent`);
       }
@@ -451,6 +463,22 @@ export class OrchestrationSessionManager extends EventEmitter {
         refreshedAt: new Date().toISOString(),
       };
     });
+  }
+
+  /**
+   * What a phone alert about a Pane is titled and grouped under: a Session's own pane is the
+   * Session, a worker is "Session › Pane", and any other Pane stands alone. `groupPaneId` is the
+   * Session's workspace pane, which the phone opens a Session by. Reads the in-memory store, like
+   * `workspaceMembership`.
+   */
+  alertSubject(paneId: string): MobileAlertSubject {
+    const sessions = this.store.read().sessions;
+    const own = sessions.find(session => session.internalSessionId === paneId);
+    if (own) return { title: own.name, groupPaneId: paneId };
+    const paneName = this.sessionManager.getSession(paneId)?.name ?? '';
+    const parent = sessions.find(session => session.associations.some(association => association.paneId === paneId));
+    if (!parent) return { title: paneName, groupPaneId: paneId };
+    return { title: paneName ? `${parent.name} › ${paneName}` : parent.name, groupPaneId: parent.internalSessionId };
   }
 
   /**
@@ -621,7 +649,7 @@ export class OrchestrationSessionManager extends EventEmitter {
   private normalizePersistedSessionAgents(data: OrchestrationSessionStoreData): OrchestrationSessionStoreData {
     let changed = false;
     const sessions = data.sessions.map(session => {
-      const agent = resolveSupportedPaneChatAgent(session.agent);
+      const agent = session.runtime === 'wsl' ? session.agent : resolveSupportedPaneChatAgent(session.agent);
       if (agent === session.agent) return session;
       changed = true;
       return { ...session, agent };
@@ -878,16 +906,17 @@ export class OrchestrationSessionManager extends EventEmitter {
   private buildTerminalState(record: OrchestrationSessionRecord): TerminalPanelState {
     const command = record.launchCommand?.trim() || RUNPANE_CONTRACT.agentTemplates[record.agent].command;
     const nativeCommand = /^(?:claude|codex|cursor-agent)(?:\s|$)/.test(command) && !/[;&|\n]/.test(command);
+    const resolvedAgent = launchAgent(command, record.customResume);
     return {
-      initialCommand: record.launchCommand?.trim() || this.skillCacheManager?.launchCommand(record.agent) || command,
+      initialCommand: record.launchCommand?.trim() || (record.runtime === 'wsl' ? command : this.skillCacheManager?.launchCommand(record.agent)) || command,
       customResume: record.customResume,
       initialInput: undefined,
       initialInputMode: 'argument',
       initialInputSubmitStrategy: 'enter',
       initialInputDeliveryVersion: ORCHESTRATION_BOOTSTRAP_VERSION,
-      agentType: record.customResume ? customResumeAgentType(record.customResume) : resolveAgentTypeFromCommand(command) ?? record.agent,
+      agentType: resolvedAgent ?? record.agent,
       orchestrationSessionId: record.id,
-      orchestrationWorkspace: sessionWorkspacePath(record.id),
+      orchestrationWorkspace: sessionRuntimePath(sessionWorkspacePath(record.id), record),
       orchestrationProfile: record.profile,
       preserveLaunchCommand: !nativeCommand,
       isCliPanel: true,
@@ -908,8 +937,8 @@ export class OrchestrationSessionManager extends EventEmitter {
       internalSession,
       panel,
       agent: record.agent,
-      cwd: sessionWorkspacePath(record.id),
-      guidePath: await this.ensureGuidePath(),
+      cwd: sessionRuntimePath(sessionWorkspacePath(record.id), record),
+      guidePath: sessionRuntimePath(await this.ensureGuidePath(), record),
       started: terminalPanelManager.isTerminalInitialized(panel.id),
     };
   }
@@ -930,15 +959,16 @@ export class OrchestrationSessionManager extends EventEmitter {
       : association.panelIds.map(panelId => panelManager.getPanel(panelId)).filter((panel): panel is ToolPanel => panel !== undefined);
     const panels: OrchestrationPanelOverview[] = allPanels.map(panel => {
       const customState = decodeBoundary(panel.state.customState ?? {}, boundary.object({
-        agentType: boundary.optional(boundary.enumeration('claude', 'codex', 'cursor')),
+        agentType: boundary.optional(boundary.enumeration(...CLI_AGENT_TYPES)),
         isInitialized: boundary.optional(boundary.boolean),
       }));
       const snapshot = panel.type === 'terminal' ? terminalPanelManager.getTerminalSnapshot(panel.id) : null;
       const initialized = panel.type === 'terminal' && terminalPanelManager.isTerminalInitialized(panel.id);
+      const panelAgent = snapshot?.agentType ?? customState.agentType;
       return {
         panelId: panel.id,
         title: panel.title,
-        agentType: snapshot?.agentType ?? customState.agentType,
+        agentType: isPaneChatAgent(panelAgent) ? panelAgent : undefined,
         state: terminalPanelManager.getAgentStatus(panel.id) ?? 'unknown',
         initialized: initialized || customState.isInitialized === true,
         lastActivityAt: snapshot?.lastActivityTime,
@@ -1005,8 +1035,8 @@ export class OrchestrationSessionManager extends EventEmitter {
     return matches[0];
   }
 
-  private assertAgentSupported(agent: PaneChatAgent): void {
-    if (!isAgentSupportedOnPlatform(agent, process.platform)) {
+  private assertAgentSupported(agent: PaneChatAgent, runtime?: 'windows' | 'wsl'): void {
+    if (!isAgentSupportedOnPlatform(agent, runtime === 'wsl' ? 'wsl' : process.platform)) {
       throw new Error(`${RUNPANE_CONTRACT.agentTemplates[agent].title} is not supported on ${process.platform}.`);
     }
   }
@@ -1028,7 +1058,12 @@ export class OrchestrationSessionManager extends EventEmitter {
 }
 
 function launchAgent(command: string, resume?: CustomCommandResume | null): PaneChatAgent | undefined {
-  return customResumeAgentType(resume) ?? resolveAgentTypeFromCommand(command);
+  const commandAgent = resolveAgentTypeFromCommand(command);
+  if (commandAgent === 'opencode') {
+    throw new Error('OpenCode is a terminal-only agent and cannot be used in named Sessions');
+  }
+  const agent = customResumeAgentType(resume) ?? commandAgent;
+  return isPaneChatAgent(agent) ? agent : undefined;
 }
 
 /** An explicit agent wins; a launch command for a different agent is rejected. */
