@@ -115,6 +115,24 @@ describe('terminal status events', () => {
     expect(journal.readAfter(0).entries.map(entry => entry.kind)).toEqual(['agent.busy', 'panel.exited']);
   });
 
+  it('reports a new blocking screen behind an unchanged blocked state', async () => {
+    const fixture = attach('claude');
+    const rule = '─'.repeat(60);
+    fixture.data(['', rule, ' Accessing workspace:', '', ' /tmp/session', '', ' ❯ No, exit', '   Yes, I trust this folder', '', ' Enter to confirm · Esc to cancel'].join('\r\n'));
+    await pollAgentStatus();
+    const statuses = () => events.filter(event => event.channel === 'panel:agentStatus').map(event => event.payload);
+    expect(statuses().at(-1)).toMatchObject({ state: 'blocked', reason: 'workspace_trust_prompt' });
+    const journalLength = journal.readAfter(0).entries.length;
+
+    fixture.data(['\x1b[2J\x1b[H', rule, ' WARNING: Claude Code running in Bypass Permissions mode', '', ' ❯ No, exit', '   Yes, I accept', '', ' Enter to confirm · Esc to cancel'].join('\r\n'));
+    await pollAgentStatus();
+    expect(statuses().at(-1)).toMatchObject({ state: 'blocked', reason: 'live_selection_menu' });
+    expect(journal.readAfter(0).entries).toHaveLength(journalLength);
+    const count = statuses().length;
+    await pollAgentStatus();
+    expect(statuses()).toHaveLength(count);
+  });
+
   it('retires destroyed terminals before old exit and data callbacks can affect a replacement', async () => {
     vi.spyOn(manager, 'saveTerminalState').mockResolvedValue();
     const old = attach('codex');
@@ -357,6 +375,22 @@ describe('terminal status events', () => {
         scrollbackBuffer: expect.stringContaining('terminal output to persist'),
       }),
     }) });
+  });
+
+  it('records the screen an exited agent finished on', async () => {
+    const fixture = attach('codex');
+    const panel: ToolPanel = {
+      id: 'p', sessionId: 's', type: 'terminal', title: 'Codex',
+      state: { isActive: true, customState: { initialInput: 'task' } },
+      metadata: { createdAt: '', lastActiveAt: '', position: 0 },
+    };
+    panelManager.getPanel.mockReturnValue(panel);
+    panelManager.updatePanel.mockResolvedValue(undefined);
+    fixture.data('All tests passed');
+    fixture.exit();
+    await vi.waitFor(() => expect(panelManager.updatePanel).toHaveBeenCalledWith('p', { state: expect.objectContaining({
+      customState: expect.objectContaining({ initialInput: 'task', screenText: expect.stringContaining('All tests passed') }),
+    }) }));
   });
 
   it('discards a terminal state read after the terminal was replaced', async () => {

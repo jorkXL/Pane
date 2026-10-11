@@ -132,6 +132,7 @@ runpane lock acquire --name testing-account --ttl 30m --wait 1800000 --note "cal
 runpane lock release --name testing-account --json
 runpane lock list --json
 runpane agents start --repo active --name fix-login --agent claude --prompt "Fix the login redirect" --yes --json
+runpane agents start --pane <pane-id> --agent codex --prompt "Review the PR from this branch and report findings" --yes --json
 runpane agents status --pane <pane-id> --json
 runpane agents send --pane <pane-id> --text "Also add a test" --yes --json
 runpane report --state ready --pr 747 --head fc5dce9 --summary-file /tmp/report.md --json
@@ -185,7 +186,7 @@ For `panes create --wait-ready`, `initialInput.delivery` says where the prompt w
 
 `runpane panes focus` raises the Pane window and selects a Pane (and optionally one of its panels) exactly like clicking it in the UI. Because it steals the user's window focus, run it only on an explicit user request to open, focus, show, or switch to a Pane; never focus a Pane proactively, the same doctrine that keeps `panes create` background/no-focus for `--source agent`.
 
-`runpane panels open` opens a URL or a file from the Pane worktree as a tab in an existing Pane (default: the calling panel's Pane from `PANE_SESSION_ID`), in split view beside the agent unless `--tab` is passed. Files open in an editor tab with read-only previews for supported formats, including HTML source; an existing tab showing the same target is reused. It activates the tab inside the Pane but never raises or focuses the Pane window.
+`runpane panels open` opens a URL or a file from the Pane worktree as a tab in an existing Pane (default: the calling panel's Pane from `PANE_SESSION_ID`), in split view beside the agent unless `--tab` is passed. Files open in an editor tab with read-only previews for supported formats, including HTML source; an existing tab showing the same target is reused. It brings the tab forward for clients already showing that Pane, and never raises or focuses the Pane window or switches anyone's Pane.
 
 `runpane panels list` lists tool panels inside one Pane session.
 
@@ -227,7 +228,7 @@ A watch releases its pending slot when its client socket or named pipe disconnec
 
 `runpane lock acquire|release|list` coordinate a resource shared between agents, such as one test account. The caller's Pane and panel own the lock; it is scoped to the owner's Session (or global outside one), renews for the same owner, and is released on TTL expiry, owner panel exit, or owner Pane archive. `--wait` blocks in the daemon until the lock comes free.
 
-`runpane agents start|status|send` finish the three common agent jobs in one call each: start an agent on a task in a repository, check on it, and send it a follow-up.
+`runpane agents start|status|send` finish the three common agent jobs in one call each: start an agent on a task (a new tab in the work's Pane with `--pane <id>`, or a new Pane for new work), check on it, and send it a follow-up.
 
 `runpane report --state ready|blocked|failed|done` is how a worker hands back its result. It stores the latest report on the worker's panel (state, `--pr`, `--head`, up to 16,000 characters of `--summary` or `--summary-file`, and the `--question` a blocked worker needs answered), journals an opt-in `agent.report` watch event (`REPORT <pane-name> pane <pane-id> panel <panel-id> ready pr#747 fc5dce9`; it skips the `--min-interval` batch), records it as Session activity, and shows it in `agents status`, `panels list`, and `sessions overview` (`panes[].report`). Inside a Pane terminal the panel comes from `PANE_SESSION_ID` and `PANE_PANEL_ID`; elsewhere pass `--pane` and `--panel`.
 
@@ -260,22 +261,22 @@ Every command and its options, from `commands` in `contracts/runpane/contract.js
 - `panes list`: List Pane sessions in a saved repository.
 - `panes cost`: Report estimated token cost per Pane, with per-model breakdown and cache efficiency.
 - `workspace state`: Read one workspace snapshot of every Pane and CLI panel.
-- `workspace list`: List your machines on Tailscale and whether each has joined workspaces.
+- `workspace list`: List the machines on your tailnet, each with its owner, and whether each answers workspaces.
 - `workspace enable`: Put this machine's Pane on your tailnet for runpane workspace (the default when Tailscale is signed in).
 - `workspace disable`: Take this machine off runpane workspace and remove its tailscale serve handler on port 8443.
-- `workspace read`: Print a file from one of your machines; any path form works (C:\..., /mnt/c/..., /home/..., ~/...).
-- `workspace write`: Write stdin to a file on one of your machines, creating parent folders.
+- `workspace read`: Print a file from a machine on your tailnet; any path form works (C:\..., /mnt/c/..., /home/..., ~/...).
+- `workspace write`: Write stdin to a file on a machine on your tailnet, creating parent folders.
 - `workspace exec`: Run a command in another machine's shell and return stdout, stderr, the exit code, OS, and shell.
 - `handoff`: Hand your task to a fresh agent on this or another machine: check your handoff note, make the branch reachable, send the note, and start the agent on it.
 - `watch`: Wait for workspace agent and Pane transitions using a daemon-held cursor.
-- `panes create`: Create user-visible Panes (Pane sessions) backed by Pane-managed worktrees for feature/PR work and open terminal-backed tool tabs.
+- `panes create`: 1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA for it are tabs in that Pane. Create a Pane (a new worktree) only when the work's branch has no Pane yet; for review, audit, fix or QA on existing work use `panels create --pane <id>`.
 - `panes adopt`: Adopt an existing externally managed git worktree as a Pane without changing the worktree.
 - `panes archive`: Archive a Pane (session) exactly like the UI Archive action, including safe removal of its Pane-managed git worktree, or archive every merged Pane in a Session.
 - `panes pin`: Declaratively pin a Pane; pinned is the Pane UI's favorite/pin star and repeated requests are idempotent.
 - `panes unpin`: Declaratively unpin a Pane; pinned is the Pane UI's favorite/pin star and repeated requests are idempotent.
 - `panes rename`: Rename a Pane without changing its worktree, branch, panels, or focus.
 - `panes focus`: Raise the Pane window and select a Pane (and optionally one of its panels) on explicit user request.
-- `panels create`: Create a terminal-backed tool panel inside an existing Pane session.
+- `panels create`: Open a new agent or terminal tab inside an existing Pane, sharing its worktree. The default for review, QA, fixes and any other agent on work that already has a Pane.
 - `panels open`: Open a URL or file as a browser/editor tab in a Pane, in split view beside the agent by default.
 - `panels list`: List tool panels inside a Pane session.
 - `panels output`: Read recent terminal output from a panel.
@@ -305,7 +306,7 @@ Every command and its options, from `commands` in `contracts/runpane/contract.js
 - `links open`: Open a pane:// link in the running Pane app.
 - `docs search`: Search Pane's docs, runpane help, and the Pane Chat skills.
 - `docs read`: Read one Pane doc, help topic, or skill in full.
-- `agents start`: Start an agent on a task: create a Pane in a repository, launch the agent with the prompt, and wait until it is ready.
+- `agents start`: Start an agent on a task and wait until it is ready: as a new tab in an existing Pane with --pane <id> (review, audit, fix, QA), or in a new Pane with --repo and --name for new work.
 - `agents status`: Check on an agent: whether it is working, ready, blocked, or idle, plus its current screen.
 - `agents send`: Send a follow-up message to an agent and confirm it was submitted.
 - `report`: Hand back a worker's structured report: state, PR, head commit, summary, and the question when blocked.
@@ -395,7 +396,7 @@ runpane links create --session <session-id> [--json]
 runpane links open --url <pane-url> --yes [--json] [--pane-dir <path>]
 runpane docs search --query <text> [--limit <count>] [--json]
 runpane docs read --doc <path> [--json]
-runpane agents start --repo <selector> --name <name> (--agent <codex|claude|cursor>|--tool-command <command>) --prompt <task> [--base-branch <branch>] --yes [--json] [--pane-dir <path>]
+runpane agents start (--pane <pane-id> | --repo <selector> --name <name> [--base-branch <branch>]) (--agent <codex|claude|cursor>|--tool-command <command>) --prompt <task> --yes [--json] [--pane-dir <path>]
 runpane agents status (--pane <pane-id>|--panel <panel-id>) [--limit <count>] [--json] [--pane-dir <path>]
 runpane agents send (--pane <pane-id>|--panel <panel-id>) --text <message> [--as-file-pointer] --yes [--json] [--pane-dir <path>]
 runpane report --state <ready|blocked|failed|done> [--pr <number>] [--head <sha>] [--summary <text>|--summary-file <path|->] [--question <text>] [--pane <pane-id> --panel <panel-id>] [--json] [--pane-dir <path>]
@@ -446,13 +447,13 @@ Brief tools:
 - `repos add`: Register an existing git repository with the running Pane app.
 - `panes list`: List Pane sessions, optionally scoped to a saved repository.
 - `panes cost`: Report estimated token cost per Pane, with per-model breakdown and cache efficiency.
-- `panes create`: Create user-visible Panes (Pane sessions) backed by Pane-managed worktrees for feature/PR work and open terminal-backed tool tabs.
+- `panes create`: 1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA for it are tabs in that Pane. Create a Pane (a new worktree) only when the work's branch has no Pane yet; for review, audit, fix or QA on existing work use `panels create --pane <id>`.
 - `panes archive`: Archive a Pane exactly like the UI Archive action, including safe removal of its Pane-managed git worktree, or archive every merged Pane in a Session.
 - `panes pin`: Declaratively pin a Pane (the Pane UI's favorite/pin star) without changing focus.
 - `panes unpin`: Declaratively unpin a Pane (the Pane UI's favorite/pin star) without changing focus.
 - `panes rename`: Rename a Pane without changing its worktree, branch, panels, or focus.
 - `panes focus`: Raise the Pane window and select a Pane (and optionally a panel) on explicit user request.
-- `panels create`: Create reviewer/helper terminal tabs inside an existing Pane; they share that Pane's worktree.
+- `panels create`: Open reviewer, QA, fix or helper agent tabs inside an existing Pane; they share that Pane's worktree. The default for any later agent on existing work.
 - `panels open`: Show the user an HTML page, plan, report, dev server URL, or file as a tab in split view beside the agent.
 - `panels list`: List tool panels inside a Pane session.
 - `panels output`: Read recent terminal output from a panel.
@@ -469,6 +470,8 @@ Managed AGENTS.md block body:
 ## Pane
 
 This repository is used with [Pane](https://runpane.com). Drive it with the CLI or the `pane` MCP server.
+
+1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA for it are tabs in that Pane. Open later agents with `runpane panels create --pane <id>` (MCP: `panels_create` or `agents_start` with `pane`), not a new Pane.
 
 CLI: `npm i -g runpane` (or `npx --yes runpane@latest`), then `runpane doctor --json`. Full command reference: `runpane agent-context --json`.
 
@@ -617,6 +620,9 @@ Unknown daemon flags should be forwarded rather than dropped so newer Pane versi
 ## Machine-Readable Schemas
 
 Stable `--json` response schemas live in `contracts/runpane/contract.json` under `jsonSchemas`.
+
+A failed command exits 1 and prints its message and a `Next:` line to stderr. With `--json` it also prints `jsonSchemas.error` to stdout: `{ "ok": false, "error": { "code": "...", "message": "...", "next": "..." } }`. Branch on `code`; `next` is the step to take when one is known. A command whose result has its own `ok: false` shape, such as an archive refusal or `panels last-message` without a transcript, prints that result instead, and `watch` reports failures as WATCH ERROR lines with exit 2.
+
 OpenAPI should be generated later from the stable local HTTP/API subset of the same contract, not maintained as a second source of truth.
 
 ## Download Attribution

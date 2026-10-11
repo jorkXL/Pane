@@ -250,7 +250,7 @@ const decodeErrorCode = (error: Parameters<typeof decodeBoundary>[0]): string | 
 export function buildPaneHomeSkill(): string {
   return `---
 name: pane
-description: Use Pane from inside a Pane terminal (PANE_SESSION_ID is set) through the runpane CLI. Use when delegating work to agents in their own Panes and worktrees, showing a page or file when supported, reading or sending input to another panel, or coordinating Panes from a Session orchestrator.
+description: Use Pane from inside a Pane terminal (PANE_SESSION_ID is set) through the runpane CLI. Use when starting new features in their own Panes, adding agent tabs (review, audit, fix, QA) to an existing Pane, showing a page or file when supported, reading or sending input to another panel, or coordinating Panes from a Session orchestrator.
 ---
 ${PANE_MANAGED_SKILL_MARKER}
 
@@ -278,8 +278,12 @@ of it through the \`runpane\` CLI.
 ## Common commands
 
 - Find a repository: \`runpane repos list --json\`
-- Delegate work in a new Pane:
+- 1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA for it are tabs in that Pane.
+- First check whether the work's branch already has a Pane: \`runpane panes list --repo <repo> --json\`, matching the PR's head branch against \`git -C <worktreePath> branch --show-current\`. If it does, use the tab command below.
+- Start work whose branch has no Pane yet in a new Pane:
   \`runpane panes create --repo <repo> --name <name> --agent <codex|claude|cursor> --prompt "<task>" --source agent --no-focus --wait-ready --yes --json\`
+- For work that already has a Pane (review, audit, fixes, QA), open a new agent tab in that Pane, never a new Pane:
+  \`runpane panels create --pane <pane-id> --agent <codex|claude|cursor> --initial-input "<task>" --source agent --no-focus --wait-ready --yes --json\`
 - When \`runpane agent-context --command "panels open" --json\` lists the
   command, show the user a page or file with
   \`runpane panels open --file <path> --source agent --yes --json\` or

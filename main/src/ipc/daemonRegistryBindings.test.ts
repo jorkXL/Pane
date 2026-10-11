@@ -8,6 +8,7 @@ import { registerConfigHandlers } from './config';
 import { registerGitHandlers } from './git';
 import { registerPanelHandlers } from './panels';
 import { registerPaneChatHandlers } from './paneChat';
+import { registerSshHostHandlers } from './sshHosts';
 import { registerOrchestrationSessionHandlers } from './orchestrationSessions';
 import { registerPermissionHandlers } from './permissions';
 import { registerProjectHandlers } from './project';
@@ -16,6 +17,7 @@ import { registerScriptHandlers } from './script';
 import { registerSessionHandlers } from './session';
 import { registerVoiceHandlers } from './voice';
 import { registerUsageHandlers } from './usage';
+import { registerMissionControlHandlers } from './missionControl';
 import type { AppServices } from './types';
 import { isDaemonOwnedChannel } from '../../../shared/types/daemon';
 
@@ -24,6 +26,11 @@ const USAGE_CHANNELS = [
   'usage:get-status',
   'usage:rescan',
 ] as const;
+const MISSION_CONTROL_CHANNELS = [
+  'mission-control:list-agents',
+  'mission-control:snapshots',
+] as const;
+
 const PROJECT_CHANNELS = [
   'projects:get-all',
   'projects:get-active',
@@ -128,6 +135,7 @@ const PANEL_CHANNELS = [
   'panels:get-layout',
   'panels:set-layout',
   'terminal:input',
+  'terminal:reply',
   'terminal:resize',
   'terminal:getState',
   'terminal:saveState',
@@ -390,6 +398,16 @@ describe('daemon registry IPC bindings', () => {
     expect(ipcMain.boundChannels.sort()).toEqual([...USAGE_CHANNELS].sort());
   });
 
+  it('binds daemon-owned missionControl channels through the shared registry', () => {
+    const registry = new PaneCommandRegistry();
+    const ipcMain = createIpcMainStub();
+
+    registerMissionControlHandlers(ipcMain, createServicesStub(), registry);
+
+    expect(registry.listChannels()).toEqual([...MISSION_CONTROL_CHANNELS].sort());
+    expect(ipcMain.boundChannels.sort()).toEqual([...MISSION_CONTROL_CHANNELS].sort());
+  });
+
   it('binds daemon-owned prompt channels through the shared registry', () => {
     const registry = new PaneCommandRegistry();
     const ipcMain = createIpcMainStub();
@@ -408,6 +426,18 @@ describe('daemon registry IPC bindings', () => {
 
     expect(registry.listChannels()).toEqual([...PANE_CHAT_CHANNELS].sort());
     expect(ipcMain.boundChannels.sort()).toEqual([...PANE_CHAT_CHANNELS].sort());
+  });
+
+  it('binds SSH host channels as daemon-owned, so a remote Pane lists and opens its own hosts', () => {
+    const channels = ['ssh-hosts:list', 'ssh-hosts:open'];
+    const registry = new PaneCommandRegistry();
+    const ipcMain = createIpcMainStub();
+
+    registerSshHostHandlers(ipcMain, createServicesStub(), registry);
+
+    expect(channels.every(isDaemonOwnedChannel)).toBe(true);
+    expect(registry.listChannels()).toEqual(channels);
+    expect(ipcMain.boundChannels.sort()).toEqual(channels);
   });
 
   it('binds daemon-owned orchestration Session channels through the shared registry', () => {

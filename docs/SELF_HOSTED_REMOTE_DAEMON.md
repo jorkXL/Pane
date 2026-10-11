@@ -12,7 +12,7 @@ Pane saves the profile and attempts to connect immediately. Local desktop mode i
 
 ## Workspaces or pairing codes?
 
-To let your own machines reach each other from the runpane CLI, you do not need this guide or a code. [Workspaces](RUNPANE_WORKSPACES.md) put each desktop Pane on your tailnet automatically (port 8443) and trust your Tailscale login, so `runpane workspace <machine> read|write|exec|<command>` works between your Macs, Windows PCs, and Linux machines, and the desktop app's remote mode connects to them from Settings → Remote Access → Your machines. Use the remote daemon and pairing codes in this guide for browsers and phones, and for devices signed in to someone else's Tailscale account. The remote daemon keeps port 443, and the two run side by side.
+To let machines on your tailnet reach each other from the runpane CLI, you do not need this guide or a code. [Workspaces](RUNPANE_WORKSPACES.md) put each desktop Pane on your tailnet automatically (port 8443) and trust your Tailscale login, plus everyone on the tailnet when a machine's owner allows it, so `runpane workspace <machine> read|write|exec|<command>` works between your Macs, Windows PCs, and Linux machines, and the desktop app's remote mode connects to them from Settings → Remote Access → Your computers. Use the remote daemon and pairing codes in this guide for browsers and phones, and for devices outside your tailnet. The remote daemon keeps port 443, and the two run side by side.
 
 ## Guided quick start
 
@@ -198,7 +198,7 @@ The same connection code works in the Remote Pane PWA:
 https://runpane.com/app/
 ```
 
-Use the PWA for phone or tablet access to terminal-backed remote sessions:
+Use the PWA for phone or tablet access to remote terminals, browser tabs and files:
 
 1. Set up the remote host with Tailscale or a trusted HTTPS tunnel.
 2. Copy the full `pane-remote://...` code printed by setup.
@@ -210,9 +210,43 @@ For Android, open the URL in Chrome, open the browser menu, then tap `Add to Hom
 
 SSH tunnel mode is mainly useful from desktop clients. For mobile browser access, prefer Tailscale or Manual HTTPS so the phone can reach the daemon URL directly.
 
+### Browser tabs on the phone
+
+Add Tool → Browser opens a browser tab on the phone. A new tab lists the host's listening ports, and the Ports button in the address bar opens the same list. Tap a `web` port to open it; `tcp` ports read "desktop only". The address bar is editable and reads the host's own address, such as `localhost:5173/ on <host>`. Copy URL copies the address the phone actually loads, and Open in Safari opens it outside the app. Use Open in Safari for sites that refuse to load in a frame, such as github.com: the tab cannot tell when that happens.
+
+How a host page reaches the phone:
+
+- When a phone first opens a `web` port, Pane gives that port its own HTTPS address on the host's tailnet name, `https://<host>.ts.net:<n>`, with a `tailscale serve` handler; the tab shows the page under a second later. Pane picks `n` from 44300 up, so it never takes the dev server's own port number. Handlers exist only for opened ports because Tailscale drops its whole Serve config, other apps' handlers included, once a machine holds a few hundred.
+- Each handler points at a loopback preview proxy that checks the visitor's Tailscale login, sends the request to `localhost:<port>` as the dev server expects, carries live-reload WebSockets, and drops the headers that stop a page from loading in a frame.
+- HTML files opened in a browser tab (for example by `runpane panels open --url file://...`) load from one more Serve address, with the files beside them. Files outside the page's folder are refused.
+- A handler goes when its port stops listening, when Pane quits, and at the next launch after a crash. Quit spends at most 5 seconds removing them; a launch removes any it left. Pane changes only handlers it created: their targets start with `/pane-<hash of the Pane data directory>/`, so a dev build and the installed app never remove each other's.
+
+Who can open these pages: the devices that **Who can connect** admits (see [Who is trusted](RUNPANE_WORKSPACES.md#who-is-trusted)). Phone pages need that setting on, Tailscale running on the host, and the phone on the same tailnet. A page in a frame cannot send the machine's password, so phone pages are off while password protection is on. A refused device sees "This page runs on &lt;host&gt;. Open it from a device signed in as &lt;login&gt;." A pairing code or SSH tunnel does not grant access to these pages: they need the phone on this tailnet, signed in with a login that setting admits. Navigation inside a page stays on the phone; the tab saves only the addresses you enter or pick.
+
+### Files on the phone
+
+Each pane's Explorer tab shows its worktree as a tree. Tap a text file to read and edit it; Save writes it to the host. Text files over 1 MB, and binary files that are not images, PDFs, video or audio, stay on the desktop. Images, PDFs, video and audio of any size preview on the phone, and video seeks without downloading the whole file. Open in Safari opens a preview outside the app.
+
+Browsing and editing go through the PWA's own connection, so they work over every connection the PWA supports. Previews load from the same Serve address as HTML files in browser tabs, so they need what [browser tabs on the phone](#browser-tabs-on-the-phone) need: Tailscale on the host, password protection off, and a phone signed in to a login that **Who can connect** admits. Without that, a preview explains why it cannot load. Files outside the worktree are refused.
+
 ### Remote PWA Implementation Notes
 
 The Remote Pane PWA is a browser runtime. It does not have `window.electronAPI`, so client-side PWA preferences must use browser-safe storage such as `localStorage` or explicit daemon adapter calls. Do not reuse desktop renderer preference stores that persist through Electron IPC unless the call path is guarded for browser mode.
+
+## Forwarded ports
+
+A desktop connected to a remote host reaches every port listening on the host as if it were local. Pane lists the host's ports on a new, empty browser tab and under the address bar's **Ports** button, and the desktop opens a matching listener on its own `127.0.0.1` and `::1` for each one. Only the desktop app sets up these listeners; the browser app and phones don't yet.
+
+- A browser tab at `localhost:5173` loads the host's dev server, live reload included. The address bar reads `localhost:5173` with **on &lt;host name&gt;**.
+- When something on the desktop already answers on 5173, the desktop uses the next free port, or any free port when the next 19 are taken too. The tab still reads `localhost:5173`, and the Ports list shows the local number as **here :5174**.
+- A tab never loads the desktop's own service in the host's place. While the host's Ports list is loading it waits, and when a port stops listening on the host it says the port isn't reachable, then loads once the port is back.
+- **Copy URL** copies the address that works on the desktop, for its system browser.
+- Clicking a `localhost` link in a terminal opens the host's server in your system browser, using the local port number if it moved. A link to a port that isn't forwarded right now doesn't open, so it never reaches the desktop's own service on that port.
+- When a port closes on the host, the desktop closes its listener. Disconnecting closes all of them.
+
+Each connection the desktop accepts travels over the Pane connection as a WebSocket to `/ports/<port>` on the host, which connects to `localhost:<port>` there. The host accepts it only with the same sign-in as every other request, and only for a port in its current list. Listeners stay on loopback on both machines.
+
+Every client signed in to the host can reach these ports through that route: anyone holding a pairing code, and any Tailscale login that the Workspaces "Who can connect" setting allows. They reach every listening service, including databases that trust `localhost` and debugging ports such as a Node `--inspect` port, which runs code as you. Pane's own ports are forwarded too, and its remote API keeps its own sign-in. Forwarding can't be limited to some ports. If that is more access than you want, turn off the remote daemon listener in `Settings > Remote Access` and set "Who can connect" to Off.
 
 ## Security Model
 
@@ -220,6 +254,7 @@ The Remote Pane PWA is a browser runtime. It does not have `window.electronAPI`,
 - Direct public or LAN binding is intentionally rejected.
 - Use SSH local forwarding, Tailscale Serve, or a trusted HTTPS reverse proxy that forwards to loopback.
 - Treat the generated `pane-remote://...` code like a secret. It contains the bearer token needed by the local client.
+- Any signed-in client can open a TCP connection to any port listening on the host. See [Forwarded ports](#forwarded-ports).
 
 Tailscale Serve example generated by setup:
 

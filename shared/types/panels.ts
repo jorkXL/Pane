@@ -1,5 +1,7 @@
 import type { CustomCommandResume } from './customCommandResume';
 import type { DiffScope } from './gitDiff';
+import { boundary, decodeOptionalBoundary } from '../validation/boundaryDecoder';
+import type { BoundaryCursor, BoundarySchema } from '../validation/boundaryDecoder';
 
 /**
  * Panel and session types for Pane.
@@ -69,6 +71,15 @@ export interface TerminalPanelState {
   alternateScreenBuffer?: string;         // Recent TUI/alternate-screen output, kept separate from shell scrollback
   isAlternateScreen?: boolean;            // Whether the live terminal is currently in alternate-screen/TUI mode
   serializedBuffer?: string;             // xterm.js serialized terminal state (includes full visual buffer)
+  /**
+   * The emulator's plain-text view of the screen at the last save.
+   *
+   * `alternateScreenBuffer` is the raw PTY byte stream, and a full-screen TUI
+   * paints it with absolute cursor positioning, so stripping its escapes
+   * concatenates every glyph. Anything that wants to *read* a stopped panel
+   * (Mission Control tiles, `runpane panels screen`) wants this instead.
+   */
+  screenText?: string;
   environmentVars?: Record<string, string>; // Modified env vars
   dimensions?: { cols: number; rows: number }; // Terminal size
   cursorPosition?: { x: number; y: number }; // Cursor location
@@ -105,6 +116,8 @@ export interface TerminalPanelState {
   preserveLaunchCommand?: boolean;
   customResume?: CustomCommandResume | null;
   customResumeStarted?: boolean;
+  /** The SSH config alias this terminal connects to, for tabs opened from the SSH view. */
+  sshHost?: string;
 
   // CLI tool init state
   isCliPanel?: boolean;              // True if this terminal runs a CLI tool (claude/codex)
@@ -253,7 +266,21 @@ export interface ToolPanelMetadata {
    * 'split' opens it beside the primary group (reusing an existing side group
    * as tabs). Ignored once the panel is in the stored layout.
    */
-  openPlacement?: 'split' | 'tab';
+  openPlacement?: PanelOpenPlacement;
+}
+
+export type PanelOpenPlacement = 'split' | 'tab';
+
+/**
+ * Payload of `panel:activeChanged`: the host or an agent asks clients to bring
+ * a tab forward. Only clients already showing `sessionId` follow it; a client's
+ * own tab click never produces one. `placement` is set when `runpane panels
+ * open` opens or reopens the tab.
+ */
+export interface PanelActivationRequest {
+  sessionId: string;
+  panelId: string;
+  placement?: PanelOpenPlacement;
 }
 
 export interface CreatePanelRequest {
@@ -264,6 +291,7 @@ export interface CreatePanelRequest {
   initialState?: TerminalPanelState | DiffPanelState | ExplorerPanelState | EditorPanelState | LogsPanelState | DashboardPanelState | SetupTasksPanelState | BrowserPanelState | { customState?: unknown };
   metadata?: Partial<ToolPanelMetadata>; // Optional metadata overrides
   activate?: boolean;            // Defaults to true; false creates the panel in the background.
+  announceActivation?: boolean;  // Host-initiated: also ask clients on this Pane to show it (panel:activeChanged).
 }
 
 export interface UpdatePanelRequest {
@@ -466,4 +494,45 @@ export interface SessionPanelLayout {
   focusedGroupId?: string;
   /** Id of the group that is zoomed (fills the stage); null/undefined when not zoomed. */
   zoomedGroupId?: string | null;
+}
+
+const panelGroupSchema: BoundarySchema<PanelGroupNode> = boundary.object({
+  type: boundary.literal('group'),
+  id: boundary.string,
+  panelIds: boundary.array(boundary.string),
+  activePanelId: boundary.nullable(boundary.string),
+});
+
+// The tree is recursive, so the node schema is a thunk: `decodePanelLayoutNode`
+// is hoisted and only called once both schemas below it have initialized.
+const panelLayoutNodeSchema: BoundarySchema<PanelLayoutNode> = {
+  decode(current: BoundaryCursor): PanelLayoutNode {
+    return decodePanelLayoutNode(current);
+  },
+};
+
+const panelSplitSchema: BoundarySchema<PanelSplitNode> = boundary.object({
+  type: boundary.literal('split'),
+  id: boundary.string,
+  direction: boundary.enumeration('row', 'column'),
+  children: boundary.array(panelLayoutNodeSchema),
+  sizes: boundary.array(boundary.number),
+});
+
+const panelLayoutNodeUnion = boundary.union(panelGroupSchema, panelSplitSchema);
+
+function decodePanelLayoutNode(current: BoundaryCursor): PanelLayoutNode {
+  return panelLayoutNodeUnion.decode(current);
+}
+
+const sessionPanelLayoutSchema: BoundarySchema<SessionPanelLayout> = boundary.object({
+  version: boundary.literal(1),
+  root: panelLayoutNodeSchema,
+  focusedGroupId: boundary.optional(boundary.string),
+  zoomedGroupId: boundary.optional(boundary.nullable(boundary.string)),
+});
+
+/** Returns null for anything that is not a version 1 layout tree. */
+export function decodeSessionPanelLayout<Value>(value: Value): SessionPanelLayout | null {
+  return decodeOptionalBoundary(value, sessionPanelLayoutSchema) ?? null;
 }

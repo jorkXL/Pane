@@ -376,6 +376,32 @@ describe('PaneRemoteHttpApiServer', () => {
     );
   });
 
+  it('scopes terminal acknowledgements to the authenticated remote runtime', async () => {
+    const registry = new PaneCommandRegistry();
+    const handler = vi.fn(async () => ({ ok: true }));
+    registry.register('terminal:ack', handler);
+
+    const server = new PaneRemoteHttpApiServer(registry, createConfigManagerStub(createEnabledRemoteConfig()));
+    activeServers.push(server);
+    await server.start();
+
+    await expect(requestJson(server, 'POST', '/invoke', {
+      channel: 'terminal:ack',
+      args: ['panel-1', 42, 'renderer-viewer-1'],
+    }, 'secret-token', {
+      'X-Pane-Remote-Runtime-Id': 'runtime-1',
+    })).resolves.toMatchObject({
+      statusCode: 200,
+      body: { ok: true },
+    });
+
+    expect(handler).toHaveBeenCalledWith(
+      'panel-1',
+      42,
+      'remote:client-1:runtime-1:viewer:renderer-viewer-1',
+    );
+  });
+
   it('scopes browser terminal visibility invokes to the body runtime id', async () => {
     const registry = new PaneCommandRegistry();
     const handler = vi.fn(async () => ({ ok: true }));
@@ -887,6 +913,51 @@ describe('workspace identity mode', () => {
     server.getEventSink().send('session:created', { id: 'session-1' });
     await expect(stream.nextEvent(100)).rejects.toThrow('Timed out waiting for SSE event');
     stream.close();
+  });
+
+  it.each([
+    ['visibility narrows to "Only me"', ownerOnly({ visibility: 'owner' }), {}],
+    ['password protection turns on', ownerOnly({ visibility: 'tailnet', verifySecret: passwordIs('correct horse') }), {}],
+    [
+      'the password changes',
+      ownerOnly({ visibility: 'tailnet', verifySecret: passwordIs('new password') }),
+      { previous: ownerOnly({ visibility: 'tailnet', verifySecret: passwordIs('old password') }), password: 'old password' },
+    ],
+  ])('refuses an invoke whose body finishes uploading after %s', async (_change, revoked, { previous, password }: { previous?: WorkspaceAccessPolicy; password?: string }) => {
+    let policy = previous ?? ownerOnly({ visibility: 'tailnet' });
+    let checks = 0;
+    const server = await startWorkspaceServer(() => {
+      checks += 1;
+      return policy;
+    });
+    const address = server.getAddress();
+    if (!address) throw new Error('Remote HTTP API server is not listening');
+
+    const response = new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+      const request = http.request({
+        host: address.host,
+        port: address.port,
+        path: invokePath,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...as(teammate, password) },
+      }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => resolve({ statusCode: res.statusCode ?? 0, body }));
+      });
+      activeRequests.add(request);
+      request.on('error', reject);
+      const body = JSON.stringify(invoke);
+      request.write(body.slice(0, 10));
+      void vi.waitFor(() => expect(checks).toBeGreaterThan(0)).then(() => {
+        policy = revoked;
+        request.end(body.slice(10));
+      });
+    });
+
+    const result = await response;
+    expect(result.statusCode).toBeGreaterThanOrEqual(400);
+    expect(result.body).not.toContain('devbox');
   });
 
   it('drops a connected client when password protection is turned on', async () => {

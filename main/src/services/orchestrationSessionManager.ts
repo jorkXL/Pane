@@ -57,6 +57,8 @@ import { boundary, decodeBoundary } from '../../../shared/validation/boundaryDec
 import { OrchestrationSessionStore } from './orchestrationSessionStore';
 import type { WorkspaceSessionMembership } from './workspaceJournal';
 import { readPanelAgentReport } from './agentReport';
+import { applyTerminalInput, sessionNameFromMessage } from './sessionAutoName';
+import { PaneError } from '../../../shared/paneError';
 import type { MobileAlertSubject } from '../daemon/mobilePushSender';
 
 const ORCHESTRATION_SESSION_PANEL_PREFIX = '__orchestration_panel_';
@@ -76,6 +78,9 @@ function isPaneChatAgent(agent: string | undefined): agent is PaneChatAgent {
 
 export class OrchestrationSessionManager extends EventEmitter {
   private initialized = false;
+  /** The line a person is typing into each Session agent panel, until its first message names the Session. */
+  private readonly firstMessageDrafts = new Map<string, string | null>();
+  private readonly namedPanelIds = new Set<string>();
 
   constructor(
     private readonly configManager: ConfigManager,
@@ -142,7 +147,8 @@ export class OrchestrationSessionManager extends EventEmitter {
       const panel = await this.ensurePanelForAgent(record);
       const internalSession = this.sessionManager.getSession(record.internalSessionId);
       if (!internalSession) throw new Error(`Session ${record.id} internal terminal session is missing`);
-      await panelManager.setActivePanel(internalSession.id, panel.id);
+      // A client opening its view: last used only, so other clients on this Session stay put.
+      await panelManager.rememberActivePanel(internalSession.id, panel.id);
       return {
         session: clone(record),
         internalSession,
@@ -217,6 +223,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         wslDistribution: input.wslDistribution,
         id,
         name,
+        nameIsDefault: !sourcePanel && input.nameFromFirstMessage ? true : undefined,
         promotedFrom: sourcePanel && sourcePane ? { paneId: sourcePane.id, panelId: sourcePanel.id } : undefined,
         archived: false,
         isPinned: input.isPinned ?? false,
@@ -326,6 +333,7 @@ export class OrchestrationSessionManager extends EventEmitter {
         updatedAt: new Date().toISOString(),
         activity: [...current.activity],
       };
+      if (input.name !== undefined) delete nextRecord.nameIsDefault;
       if (input.name !== undefined && data.sessions.some(session => session.id !== current.id && normalizeSessionName(session.name) === normalizeSessionName(nextRecord.name))) {
         throw new Error(`A Session named ${nextRecord.name} already exists`);
       }
@@ -333,7 +341,9 @@ export class OrchestrationSessionManager extends EventEmitter {
       if (nextRecord.archived === true && nextRecord.agent !== current.agent) {
         throw new Error(`Session ${current.name} is archived; restore it before changing its agent`);
       }
-      const updateActivity = this.activity(input.report ? 'report' : 'updated', input.report ? `Reported: ${input.report.summary}` : 'Updated Session context.', input.source ?? 'user');
+      const renamed = input.name !== undefined && nextRecord.name !== current.name;
+      const updateMessage = input.report ? `Reported: ${input.report.summary}` : renamed ? `Renamed to “${nextRecord.name}”.` : 'Updated Session context.';
+      const updateActivity = this.activity(input.report ? 'report' : 'updated', updateMessage, input.source ?? 'user');
       nextRecord.activity.push(updateActivity);
       if (input.report) {
         nextRecord.reportActivityId = updateActivity.id;
@@ -388,7 +398,11 @@ export class OrchestrationSessionManager extends EventEmitter {
       for (const other of data.sessions) {
         if (other.id === current.id) continue;
         if (other.associations.some(association => association.paneId === input.paneId)) {
-          throw new Error(`Pane ${pane.name} is already associated with Session ${other.name}`);
+          throw new PaneError(
+            'ERR_PANE_ALREADY_ASSOCIATED',
+            `Pane ${pane.name} is already associated with Session ${other.name}`,
+            `It stays with ${other.name}. To move it, detach it there first with \`runpane sessions detach --session ${other.id} --pane ${pane.id}\`, then associate it.`,
+          );
         }
       }
       const joined = !current.associations.some(item => item.paneId === input.paneId);
@@ -430,12 +444,14 @@ export class OrchestrationSessionManager extends EventEmitter {
       const current = this.findSession(data, selector);
       const removed = paneId ? current.associations.filter(item => item.paneId === paneId) : current.associations;
       if (paneId && removed.length === 0) throw new Error(`Session ${current.name} is not associated with Pane ${paneId}`);
+      const paneName = paneId ? this.sessionManager.getSession(paneId)?.name : undefined;
+      const message = !paneId ? 'Detached all Panes.' : paneName ? `Detached Pane “${paneName}”.` : `Detached Pane ${paneId}.`;
       const nextRecord = {
         ...current,
         associations: paneId ? current.associations.filter(item => item.paneId !== paneId) : [],
         revision: current.revision + 1,
         updatedAt: new Date().toISOString(),
-        activity: [...current.activity, this.activity('detached', paneId ? `Detached Pane ${paneId}.` : 'Detached all Panes.', 'user', paneId)],
+        activity: [...current.activity, this.activity('detached', message, 'user', paneId)],
       };
       trimActivity(nextRecord);
       this.store.write(replaceSession(data, nextRecord));
@@ -463,6 +479,34 @@ export class OrchestrationSessionManager extends EventEmitter {
         refreshedAt: new Date().toISOString(),
       };
     });
+  }
+
+  /** Terminal input a person typed. The first message to a Session agent renames a Session that still has its default name. */
+  observeInput(panelId: string, data: string): void {
+    if (!panelId.startsWith(ORCHESTRATION_SESSION_PANEL_PREFIX) || this.namedPanelIds.has(panelId)) return;
+    const previous = this.firstMessageDrafts.get(panelId);
+    const { draft, submitted } = applyTerminalInput(previous === undefined ? '' : previous, data);
+    const name = submitted.map(sessionNameFromMessage).find(Boolean);
+    if (!name) {
+      this.firstMessageDrafts.set(panelId, draft);
+      return;
+    }
+    this.firstMessageDrafts.delete(panelId);
+    this.namedPanelIds.add(panelId);
+    void this.nameFromFirstMessage(panelId, name).catch(error => {
+      this.namedPanelIds.delete(panelId);
+      console.warn('[OrchestrationSessionManager] Could not name the Session from its first message:', error);
+    });
+  }
+
+  private async nameFromFirstMessage(panelId: string, name: string): Promise<void> {
+    const { sessions } = await this.list();
+    const record = sessions.find(session => session.panelIds[session.agent] === panelId);
+    if (!record?.nameIsDefault) return;
+    const taken = new Set(sessions.filter(session => session.id !== record.id).map(session => normalizeSessionName(session.name)));
+    let uniqueName = name;
+    for (let suffix = 2; taken.has(normalizeSessionName(uniqueName)); suffix += 1) uniqueName = `${name} ${suffix}`;
+    await this.update({ sessionId: record.id }, { name: uniqueName, expectedRevision: record.revision, source: 'system' });
   }
 
   /**
@@ -1030,8 +1074,8 @@ export class OrchestrationSessionManager extends EventEmitter {
       matches = data.sessions.filter(session => session.name === selector.sessionId);
     }
     const selectorLabel = selector.name ?? selector.sessionId;
-    if (matches.length === 0) throw new Error(`Session ${selectorLabel} not found`);
-    if (matches.length > 1) throw new Error(`Session selector ${selectorLabel} is ambiguous`);
+    if (matches.length === 0) throw new PaneError('ERR_SESSION_NOT_FOUND', `Session ${selectorLabel} not found`, 'Pick a Session from `runpane sessions list --json`.');
+    if (matches.length > 1) throw new PaneError('ERR_SESSION_AMBIGUOUS', `Session selector ${selectorLabel} is ambiguous`, 'Use the Session id from `runpane sessions list --json`.');
     return matches[0];
   }
 

@@ -24,6 +24,7 @@ import { panelManager as terminalPanelStore } from '../test/setup';
 import { terminalPanelManager } from '../services/terminalPanelManager';
 import { databaseService as panelDatabase } from '../services/database';
 import { ArchiveProgressManager } from '../services/archiveProgressManager';
+import { WorktreeManager } from '../services/worktreeManager';
 import { removeWorktreeViaTrash, waitForPendingWorktreeTrash } from '../services/worktreeTrash';
 import { WorkspaceJournal } from '../services/workspaceJournal';
 import { OrchestrationSessionManager } from '../services/orchestrationSessionManager';
@@ -37,6 +38,7 @@ import { agentTranscripts } from '../services/agentTranscript';
 import { claudeProjectDirName } from '../services/agentTranscript/claude';
 import { registerRunpaneHandlers } from './runpane';
 import type { TaskQueue } from '../services/taskQueue';
+import { PaneError } from '../../../shared/paneError';
 
 // Transcript reads are real file I/O; these tests script what the transcript says.
 const findUserTurnSince = vi.spyOn(agentTranscripts, 'findUserTurnSince');
@@ -46,6 +48,7 @@ vi.spyOn(panelManager, 'getPanel');
 vi.spyOn(panelManager, 'getPanelsForSession');
 vi.spyOn(panelManager, 'updatePanel');
 vi.spyOn(panelManager, 'setActivePanel');
+vi.spyOn(panelManager, 'rememberActivePanel');
 vi.spyOn(panelManager, 'ensureExplorerPanel');
 vi.spyOn(panelManager, 'ensureDiffPanel');
 vi.spyOn(terminalPanelManager, 'initializeTerminal');
@@ -210,6 +213,7 @@ function createServices(overrides: Partial<AppServices> = {}): AppServices {
       })),
     },
     sessionManager: {
+      emit: vi.fn(() => true),
       getAllSessions: vi.fn(() => [session]),
       getSessionsForProject: vi.fn(() => [session]),
       getSession: vi.fn(() => session),
@@ -222,9 +226,8 @@ function createServices(overrides: Partial<AppServices> = {}): AppServices {
         timestamp: new Date('2026-01-01T00:02:00.000Z'),
       }]),
       getProjectContext: vi.fn(() => ({
-        commandRunner: {
-          wslContext: null,
-        },
+        project,
+        commandRunner: new CommandRunner({ path: os.tmpdir() }),
       })),
       getProjectContextByProjectId: vi.fn(() => ({
         commandRunner: {
@@ -239,6 +242,7 @@ function createServices(overrides: Partial<AppServices> = {}): AppServices {
       })),
     },
     taskQueue: {
+      ...idleSetupQueue(),
       createSessionAndWait: vi.fn(async () => ({ sessionId: session.id })),
     },
     analyticsManager: {
@@ -248,8 +252,9 @@ function createServices(overrides: Partial<AppServices> = {}): AppServices {
     },
     spotlightManager: {},
     worktreeManager: {
+      listWorktrees: vi.fn(async () => []),
       getUpstream: vi.fn(async () => null),
-      getSessionComparisonBranch: vi.fn(async () => 'main'),
+      getSessionLocalBaseBranch: vi.fn(async () => 'main'),
     },
     gitStatusManager: {
       getGitStatus: vi.fn(async () => ({
@@ -263,6 +268,11 @@ function createServices(overrides: Partial<AppServices> = {}): AppServices {
     },
     ...overrides,
   } as AppServices;
+}
+
+/** A setup queue with a free slot: setup runs at once and is already done. */
+function idleSetupQueue(): Pick<TaskQueue, 'setupQueuePosition' | 'waitForSetup'> {
+  return { setupQueuePosition: vi.fn(() => undefined), waitForSetup: vi.fn(async () => {}) };
 }
 
 const tempDirs: string[] = [];
@@ -320,6 +330,7 @@ describe('runpane IPC handlers', () => {
     vi.mocked(panelManager.getPanelsForSession).mockReset();
     vi.mocked(panelManager.updatePanel).mockReset();
     vi.mocked(panelManager.setActivePanel).mockReset();
+    vi.mocked(panelManager.rememberActivePanel).mockReset().mockResolvedValue();
     vi.mocked(panelManager.ensureExplorerPanel).mockReset().mockResolvedValue(undefined);
     vi.mocked(panelManager.ensureDiffPanel).mockReset().mockResolvedValue(undefined);
     vi.mocked(terminalPanelManager.initializeTerminal).mockReset();
@@ -504,6 +515,33 @@ describe('runpane IPC handlers', () => {
       expect(result).toMatchObject({ ok: true, items: [{ ok: true, worktreePath: fs.realpathSync.native(worktreePath) }] });
       expect(services.sessionManager.createSession).not.toHaveBeenCalled();
       expect(panelManager.createPanel).not.toHaveBeenCalled();
+    });
+
+    it('keeps an adopted Pane when the --focus request cannot be delivered', async () => {
+      const repoPath = createTempGitRepo('adopt-focus-repo');
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: repoPath, stdio: 'ignore' });
+      const worktreePath = path.join(path.dirname(repoPath), 'adopt-focus-worktree');
+      execFileSync('git', ['worktree', 'add', '-b', 'feature', worktreePath], { cwd: repoPath, stdio: 'ignore' });
+      vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
+      setPaneRuntime({
+        eventSink: { send: (channel: string) => { if (channel === 'pane:focus-requested') throw new Error('sink closed'); } },
+        getConfigManager: () => { throw new Error('unused'); },
+        getPtyHostRuntime: () => null,
+        getWebviewContextMap: () => new Map(),
+      });
+      try {
+        const services = adoptionServices(repoPath, worktreePath);
+        const result = await createRegistry(services).invoke('runpane:panes:adopt', [{
+          repo: { id: project.id },
+          focus: true,
+          panes: [{ path: worktreePath, name: 'Adopted', tool: { command: 'bash' } }],
+        }]);
+
+        expect(result).toMatchObject({ ok: true, items: [{ ok: true, paneId: session.id }] });
+        expect(services.sessionManager.archiveSession).not.toHaveBeenCalled();
+      } finally {
+        resetPaneRuntimeForTests();
+      }
     });
 
     it('refuses paths outside the selected repo and duplicate canonical paths', async () => {
@@ -748,8 +786,33 @@ describe('runpane IPC handlers', () => {
       const failed = await createRegistry(services).invoke('runpane:panes:adopt', [request]);
       expect(failed).toMatchObject({
         ok: true,
-        items: [{ ok: true, association: { ok: false, error: 'Pane is already associated with Session Other' } }],
+        items: [{ ok: true, association: {
+          ok: false,
+          error: `Could not add Pane ${session.id} to Session orchestrator-1: Pane is already associated with Session Other. The Pane was created and kept. Add it with \`runpane sessions associate --session orchestrator-1 --pane ${session.id}\`.`,
+        } }],
       });
+    });
+
+    it('points a missing Session at the Session list instead of repeating it', async () => {
+      const repoPath = createTempGitRepo('associate-missing-repo');
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: repoPath, stdio: 'ignore' });
+      const worktreePath = path.join(path.dirname(repoPath), 'associate-missing-worktree');
+      execFileSync('git', ['worktree', 'add', '-b', 'associate-missing', worktreePath], { cwd: repoPath, stdio: 'ignore' });
+      const associate = vi.fn(async () => { throw new PaneError('ERR_SESSION_NOT_FOUND', 'Session typo not found'); });
+      // SAFETY: The handler only calls associate on the Sessions manager.
+      const services = { ...adoptionServices(repoPath, worktreePath), orchestrationSessionManager: { associate } as never };
+      vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
+
+      const result = await createRegistry(services).invoke('runpane:panes:adopt', [{
+        repo: { id: project.id },
+        panes: [{ path: worktreePath, name: 'Adopted', tool: { agent: 'codex' } }],
+        associateSession: 'typo',
+      }]);
+
+      expect(result).toMatchObject({ items: [{ ok: true, association: {
+        ok: false,
+        error: `Could not add Pane ${session.id} to Session typo: Session typo not found. The Pane was created and kept. Pick the Session's id from \`runpane sessions list --json\`, then run \`runpane sessions associate --session <id> --pane ${session.id}\`.`,
+      } }] });
     });
 
     it('does not associate panes when no Session is given', async () => {
@@ -1023,6 +1086,26 @@ describe('runpane IPC handlers', () => {
       expect(result).toMatchObject({ ok: false, items: [{ ok: false, sessionId: undefined }] });
       expect(services.sessionManager.archiveSession).toHaveBeenCalledWith(session.id);
       expect(services.databaseService.deleteArchivedSessionPermanently).toHaveBeenCalledWith(session.id);
+    });
+
+    it('names the archived Pane a failed rollback leaves behind', async () => {
+      const repoPath = createTempGitRepo('rollback-kept-repo');
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: repoPath, stdio: 'ignore' });
+      const worktreePath = path.join(path.dirname(repoPath), 'rollback-kept-worktree');
+      execFileSync('git', ['worktree', 'add', '-b', 'rollback-kept', worktreePath], { cwd: repoPath, stdio: 'ignore' });
+      const services = adoptionServices(repoPath, worktreePath);
+      vi.mocked(services.databaseService.deleteArchivedSessionPermanently).mockReturnValue(false);
+      vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
+      vi.mocked(terminalPanelManager.initializeTerminal).mockRejectedValue(new Error('PTY failed'));
+
+      const result = await createRegistry(services).invoke('runpane:panes:adopt', [{
+        repo: { id: project.id },
+        panes: [{ path: worktreePath, name: 'Adopted', tool: { agent: 'codex' } }],
+      }]);
+
+      expect(result).toMatchObject({ ok: false, items: [{ ok: false, sessionId: session.id, error: {
+        message: `Could not create Pane "Adopted": PTY failed. Pane ${session.id} was created, then archived to roll back, but could not be deleted, so it still holds this worktree. Open it under Archived Panes in Pane to restore or delete it before retrying.`,
+      } }] });
     });
   });
 
@@ -1952,6 +2035,8 @@ describe('runpane IPC handlers', () => {
       },
     });
     expect(services.databaseService.createProject).toHaveBeenCalledTimes(1);
+    expect(services.sessionManager.emit).toHaveBeenCalledTimes(1);
+    expect(services.sessionManager.emit).toHaveBeenCalledWith('project:list-changed');
     expect(fs.readFileSync(path.join(repoPath, 'AGENTS.md'), 'utf8')).toContain('runpane agent-context');
   });
 
@@ -2126,8 +2211,11 @@ describe('runpane IPC handlers', () => {
       } as AppServices['databaseService'],
     });
 
-    await expect(createRegistry(services).invoke('runpane:panes:cost', [{ paneId: 'missing' }]))
-      .rejects.toThrow('No Pane pane found with id missing');
+    await expect(createRegistry(services).invoke('runpane:panes:cost', [{ paneId: 'missing' }])).rejects.toMatchObject({
+      code: 'ERR_RUNPANE_PANE_NOT_FOUND',
+      message: 'No Pane found with id missing. Nothing was changed.',
+      next: 'See Pane ids with `runpane panes list`.',
+    });
   });
 
   it('scopes pane costs to a repository and omits workspace totals', async () => {
@@ -3269,6 +3357,42 @@ describe('runpane IPC handlers', () => {
     });
   });
 
+  it('reads a stopped panel from its persisted screen text, not the raw byte log', async () => {
+    // No live terminal: the panel's own state is all there is to read.
+    vi.mocked(terminalPanelManager.getTerminalSnapshot).mockReturnValue(null);
+    vi.mocked(terminalPanelManager.isTerminalInitialized).mockReturnValue(false);
+    vi.mocked(panelManager.getPanel).mockImplementation((panelId: string) => (
+      panelId === terminalPanel.id
+        ? {
+            ...terminalPanel,
+            state: {
+              ...terminalPanel.state,
+              customState: {
+                ...terminalPanel.state.customState,
+                isAlternateScreen: true,
+                // What a full-screen TUI leaves behind: positioning, no spaces.
+                alternateScreenBuffer: '\x1b[Hitems\x1b[12Gand\x1b[20Gfind',
+                screenText: 'items      and     find\nsecond row',
+              },
+            },
+          }
+        : undefined
+    ));
+    const registry = createRegistry();
+
+    const result = await registry.invoke('runpane:panels:screen', [{
+      panelId: terminalPanel.id,
+      limit: 10,
+    }]);
+
+    // Stripping the byte log would collapse this to "itemsandfind".
+    expect(result).toMatchObject({
+      ok: true,
+      source: 'persistedOutput',
+      text: 'items      and     find\nsecond row',
+    });
+  });
+
   it('waits for ready terminal state with bounded screen output', async () => {
     vi.useFakeTimers();
     vi.mocked(terminalPanelManager.getTerminalSnapshot).mockReturnValue({
@@ -4032,7 +4156,7 @@ describe('runpane IPC handlers', () => {
   });
 
   describe('panes create --branch', () => {
-    function branchServices(existingBranches: string[] = []): AppServices {
+    function branchServices(existingBranches: string[] = [], paneRows: Array<{ id: string; name: string; worktree_path: string }> = []): AppServices {
       const repoPath = createTempGitRepo('branch-repo');
       execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: repoPath, stdio: 'ignore' });
       execFileSync('git', ['branch', 'release/foo'], { cwd: repoPath, stdio: 'ignore' });
@@ -4040,15 +4164,45 @@ describe('runpane IPC handlers', () => {
         execFileSync('git', ['branch', branch], { cwd: repoPath, stdio: 'ignore' });
       }
       const branchProject = { ...project, path: repoPath };
-      // SAFETY: This session-manager double implements the project-context lookup the create handler uses.
+      // SAFETY: These doubles implement the project-context, worktree, and session lookups the create handler uses.
       return createServices({
-        databaseService: { ...createServices().databaseService, getAllProjects: vi.fn(() => [branchProject]) },
+        databaseService: {
+          ...createServices().databaseService,
+          getAllProjects: vi.fn(() => [branchProject]),
+          getAllSessions: vi.fn(() => paneRows),
+        } as never,
         sessionManager: {
           ...createServices().sessionManager,
-          getProjectContextByProjectId: vi.fn(() => ({ commandRunner: new CommandRunner(branchProject) })),
+          getProjectContextByProjectId: vi.fn(() => ({ commandRunner: new CommandRunner(branchProject), pathResolver: new PathResolver(branchProject) })),
         } as never,
+        worktreeManager: new WorktreeManager(),
       });
     }
+
+    it('refuses a branch another Pane has checked out and names that Pane', async () => {
+      const ownerPath = path.join(createTempGitRepo('owner-parent'), '..', 'owner-worktree');
+      const services = branchServices([], [{ id: 'pane-owner-1', name: 'Owner feature', worktree_path: ownerPath }]);
+      const repoPath = services.databaseService.getAllProjects()[0].path;
+      execFileSync('git', ['worktree', 'add', '-b', 'agents/owned', ownerPath], { cwd: repoPath, stdio: 'ignore' });
+
+      const result = await createRegistry(services).invoke('runpane:panes:create', [{
+        repo: { id: project.id },
+        panes: [{ name: 'second', branch: 'agents/owned', tool: { agent: 'codex' } }],
+      }]);
+
+      expect(result).toMatchObject({
+        ok: false,
+        items: [{
+          ok: false,
+          error: {
+            code: 'ERR_RUNPANE_BRANCH_HAS_PANE',
+            message: "Could not create Pane \"second\": Branch 'agents/owned' already has Pane \"Owner feature\" (pane-owner-1). Add this work to it as a new tab: "
+              + 'runpane panels create --pane pane-owner-1 --tool-command "<cmd>" --source agent --no-focus. No Pane was created.',
+          },
+        }],
+      });
+      expect(services.taskQueue?.createSessionAndWait).not.toHaveBeenCalled();
+    });
 
     it('passes the exact requested branch and base to pane creation', async () => {
       vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
@@ -4094,6 +4248,29 @@ describe('runpane IPC handlers', () => {
       expect(services.taskQueue?.createSessionAndWait).not.toHaveBeenCalled();
     });
 
+    it('names the winning Pane when a concurrent create takes the branch first', async () => {
+      const ownerPath = path.join(createTempGitRepo('race-parent'), '..', 'race-worktree');
+      const paneRows: Array<{ id: string; name: string; worktree_path: string }> = [];
+      const services = branchServices([], paneRows);
+      const repoPath = services.databaseService.getAllProjects()[0].path;
+      services.taskQueue!.createSessionAndWait = vi.fn(async () => {
+        // The other request created its Pane on the branch while this one waited in the queue.
+        execFileSync('git', ['worktree', 'add', '-b', 'agents/raced', ownerPath], { cwd: repoPath, stdio: 'ignore' });
+        paneRows.push({ id: 'pane-winner', name: 'Winner', worktree_path: ownerPath });
+        throw new Error("Branch 'agents/raced' already exists.");
+      });
+
+      const result = await createRegistry(services).invoke('runpane:panes:create', [{
+        repo: { id: project.id },
+        panes: [{ name: 'loser', branch: 'agents/raced', tool: { agent: 'codex' } }],
+      }]);
+
+      expect(result).toMatchObject({
+        ok: false,
+        items: [{ ok: false, error: { code: 'ERR_RUNPANE_BRANCH_HAS_PANE', message: expect.stringContaining('"Winner" (pane-winner)') } }],
+      });
+    });
+
     it('refuses the same branch twice in one request', async () => {
       await expect(createRegistry(branchServices()).invoke('runpane:panes:create', [{
         repo: { id: project.id },
@@ -4103,6 +4280,39 @@ describe('runpane IPC handlers', () => {
         ],
       }])).rejects.toThrow("names branch 'agents/x' more than once");
     });
+  });
+
+  it('returns a queued Pane at once and launches its agent after setup', async () => {
+    vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
+    let finishSetup: () => void = () => {};
+    const services = createServices({
+      // SAFETY: This queue double implements the create and setup-queue methods the create handler uses.
+      taskQueue: {
+        createSessionAndWait: vi.fn(async () => ({ sessionId: session.id })),
+        setupQueuePosition: vi.fn(() => 2),
+        waitForSetup: vi.fn(() => new Promise<void>(resolve => { finishSetup = resolve; })),
+      } as never,
+    });
+
+    const result = await createRegistry(services).invoke('runpane:panes:create', [{
+      repo: { id: project.id },
+      panes: [{ name: 'reviewer', tool: { agent: 'codex' } }],
+    }]);
+
+    expect(result).toMatchObject({
+      ok: true,
+      items: [{
+        ok: true,
+        paneId: session.id,
+        setupQueue: { position: 2, message: 'Queued for setup: 2nd in line; setup starts when an earlier Pane finishes. Its agent starts after setup.' },
+      }],
+    });
+    expect(result.items[0]).not.toHaveProperty('panelId');
+    expect(panelManager.createPanel).not.toHaveBeenCalled();
+
+    finishSetup();
+
+    await vi.waitFor(() => expect(panelManager.createPanel).toHaveBeenCalledWith(expect.objectContaining({ sessionId: session.id, type: 'terminal' })));
   });
 
   it('creates a pinned pane without focusing it', async () => {
@@ -4124,6 +4334,7 @@ describe('runpane IPC handlers', () => {
       } as never,
       // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
       taskQueue: {
+        ...idleSetupQueue(),
         createSessionAndWait: vi.fn(async (request: { startPinned?: boolean }) => {
           databaseRow.is_favorite = request.startPinned ? 1 : 0;
           databaseRow.favorite_pinned_at = request.startPinned ? '2026-07-21 12:00:00' : null;
@@ -4161,6 +4372,7 @@ describe('runpane IPC handlers', () => {
     const services = createServices({
       // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
       taskQueue: {
+        ...idleSetupQueue(),
         createSessionAndWait: vi.fn(async (...[, options]: Parameters<TaskQueue['createSessionAndWait']>) => {
           options?.onSessionCreated?.('session-created-early');
           throw new Error('Timed out waiting for session creation job 7');
@@ -4180,7 +4392,38 @@ describe('runpane IPC handlers', () => {
         ok: false,
         paneId: 'session-created-early',
         sessionId: 'session-created-early',
-        error: { code: 'ERR_RUNPANE_PANE_CREATE_FAILED' },
+        error: {
+          code: 'ERR_RUNPANE_PANE_CREATE_FAILED',
+          message: 'Could not create Pane "slow-setup-pane": Timed out waiting for session creation job 7. Pane session-created-early was created before the failure and was kept. Check it with `runpane panes list --json` before retrying, so you do not create a duplicate.',
+        },
+      }],
+    });
+  });
+
+  it('says creation may still finish when the wait times out before the Pane exists', async () => {
+    const services = createServices({
+      // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
+      taskQueue: {
+        createSessionAndWait: vi.fn(async () => {
+          throw new PaneError('ERR_PANE_CREATE_TIMEOUT', 'Timed out waiting for session creation job 8');
+        }),
+      } as never,
+    });
+
+    const result = await createRegistry(services).invoke('runpane:panes:create', [{
+      repo: 'active',
+      panes: [{ name: 'queued-pane', tool: { agent: 'claude' } }],
+    }]);
+
+    expect(result).toMatchObject({
+      ok: false,
+      items: [{
+        ok: false,
+        sessionId: undefined,
+        error: {
+          code: 'ERR_RUNPANE_PANE_CREATE_FAILED',
+          message: 'Could not confirm that Pane "queued-pane" was created: Timed out waiting for session creation job 8. Creation may still finish in the background. Check `runpane panes list --json` for it before retrying, so you do not create a duplicate.',
+        },
       }],
     });
   });
@@ -4190,6 +4433,7 @@ describe('runpane IPC handlers', () => {
     const services = createServices({
       // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
       taskQueue: {
+        ...idleSetupQueue(),
         createSessionAndWait: vi.fn(async (request: { startPinned?: boolean }) => {
           startPinnedCalls.push(request.startPinned);
           return { sessionId: session.id };
@@ -4452,7 +4696,7 @@ describe('runpane IPC handlers', () => {
     const registry = createRegistry(services);
 
     await expect(registry.invoke('runpane:panes:rename', [{ paneId: 'missing-pane', name: 'new name' }]))
-      .rejects.toThrow('No Pane pane found with id missing-pane');
+      .rejects.toThrow('No Pane found with id missing-pane');
   });
 
   it('serializes multi-pane session creation before enqueueing the next pane', async () => {
@@ -4480,6 +4724,7 @@ describe('runpane IPC handlers', () => {
     // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
     const services = createServices({
       taskQueue: {
+        ...idleSetupQueue(),
         createSessionAndWait,
       },
     } as never);
@@ -5961,7 +6206,7 @@ describe('runpane IPC handlers', () => {
 
       await expect(registry.invoke('runpane:panes:archive', [{
         paneId: 'no-such-pane',
-      }])).rejects.toThrow(/No Pane pane found/);
+      }])).rejects.toThrow(/No Pane found/);
     });
 
     it('refuses to archive a dirty pane without --force', async () => {
@@ -5975,6 +6220,7 @@ describe('runpane IPC handlers', () => {
         sessionManager: {
           ...createServices().sessionManager,
           getSession: vi.fn(() => dirtySession),
+          getProjectContext: vi.fn(() => ({ commandRunner: new CommandRunner({ path: repoPath }) })),
         } as never,
       });
       const registry = createRegistry(services);
@@ -6160,6 +6406,7 @@ describe('runpane IPC handlers', () => {
         sessionManager: {
           ...createServices().sessionManager,
           getSession: vi.fn(() => dryRunSession),
+          getProjectContext: vi.fn(() => ({ commandRunner: new CommandRunner({ path: repoPath }) })),
         } as never,
       });
       const registry = createRegistry(services);
@@ -6461,12 +6708,12 @@ describe('runpane IPC handlers', () => {
             ...createServices().sessionManager,
             getSession: vi.fn(() => adopted),
             getProjectForSession: vi.fn(() => ({ ...project, path: repoPath })),
-            getProjectContext: vi.fn(() => ({ commandRunner })),
+            getProjectContext: vi.fn(() => ({ project: { ...project, path: repoPath }, commandRunner })),
           } as never,
           // SAFETY: This test fixture intentionally supplies the minimal worktree manager surface exercised by archive.
           worktreeManager: {
             getUpstream: vi.fn(async () => null),
-            getSessionComparisonBranch: vi.fn(async () => 'main'),
+            getSessionLocalBaseBranch: vi.fn(async () => 'main'),
           } as never,
           archiveProgressManager,
         } as never);
@@ -6570,8 +6817,8 @@ describe('runpane IPC handlers', () => {
             name: 'refactor',
             associations: [{ paneId: session.id, panelIds: [], attachedAt: '2026-01-01T00:00:00.000Z' }],
           }));
-          // SAFETY: This test fixture supplies the one Sessions manager method the bulk archive calls.
-          const bulkServices: AppServices = { ...services, orchestrationSessionManager: { get } as never };
+          // SAFETY: This test fixture supplies the Sessions manager method and the PR lookup (merged) the bulk archive calls.
+          const bulkServices: AppServices = { ...services, orchestrationSessionManager: { get } as never, gitStatusManager: { lookupPrForPane: vi.fn(async () => ({ ok: true, pr: { prNumber: 42, prState: 'MERGED' } })), invalidatePrCache: vi.fn() } as never };
           const bulkRegistry = createRegistry(bulkServices);
           registerSessionsDeleteStub(bulkRegistry, bulkServices);
           await expect(bulkRegistry.invoke('runpane:panes:archive', [{ sessionId: 'refactor', merged: true, dryRun: true }])).resolves.toMatchObject({
@@ -6581,6 +6828,7 @@ describe('runpane IPC handlers', () => {
             items: [{
               paneId: session.id,
               outcome: 'would-archive',
+              pr: { state: 'merged', number: 42 },
               safetyCheck: { performed: true, mergedViaPr: { number: 42, headOid: head }, worktreeWillRemain: true },
             }],
           });
@@ -6637,19 +6885,20 @@ describe('runpane IPC handlers', () => {
           sessionManager: {
             ...createServices().sessionManager,
             getSession: vi.fn(() => featureSession),
-            getProjectContext: vi.fn(() => ({ commandRunner })),
+            getProjectContext: vi.fn(() => ({ project: { ...project, path: featureSession.worktreePath }, commandRunner })),
           } as never,
           // SAFETY: This test fixture intentionally supplies the minimal worktree manager surface exercised by archive.
           worktreeManager: {
             getUpstream: vi.fn(async () => upstream),
-            getSessionComparisonBranch: vi.fn(async () => 'main'),
+            getSessionLocalBaseBranch: vi.fn(async () => 'main'),
           } as never,
           archiveProgressManager: new ArchiveProgressManager(),
         } as never);
       }
 
-      it('counts a squash-merged branch with no upstream as safe when a merged PR has HEAD as its head', async () => {
+      it.each(['renamed-local-branch', null])('finds a merged PR by SHA with local branch %s', async (branch) => {
         const { repoPath, head } = createFeatureBranchRepo('squash-merged-repo');
+        execFileSync('git', branch ? ['branch', '-m', branch] : ['checkout', '--detach', '-q'], { cwd: repoPath, stdio: 'ignore' });
         const { commandRunner, ghCalls } = createRunnerWithGh(repoPath, {
           stdout: JSON.stringify([{ number: 7, headRefOid: 'a'.repeat(40) }, { number: 42, headRefOid: head }]),
         });
@@ -6660,7 +6909,7 @@ describe('runpane IPC handlers', () => {
         const result = await registry.invoke('runpane:panes:archive', [{ paneId: session.id, dryRun: true }]);
 
         expect(sessionsDelete).not.toHaveBeenCalled();
-        expect(ghCalls).toEqual([['pr', 'list', '--head', 'feature', '--state', 'merged', '--json', 'number,headRefOid', '--limit', '20']]);
+        expect(ghCalls).toEqual([['pr', 'list', '--search', head, '--state', 'merged', '--json', 'number,headRefOid', '--limit', '20']]);
         expect(result).toMatchObject({
           ok: true,
           wouldArchive: true,
@@ -6673,6 +6922,40 @@ describe('runpane IPC handlers', () => {
           },
         });
         expect(JSON.parse(JSON.stringify(result))).not.toHaveProperty('blocked');
+      });
+
+      it.each(['agent-config-only', 'ordinary-untracked', 'nested-agent-config', 'tracked-agent-config'])('checks archive dirtiness with %s', async (scenario) => {
+        const { repoPath, head } = createFeatureBranchRepo('agent-config-repo');
+        for (const directory of ['.codex', '.claude', '.agent-farm']) {
+          fs.mkdirSync(path.join(repoPath, directory));
+          fs.writeFileSync(path.join(repoPath, directory, 'config.json'), '{}');
+        }
+        if (scenario === 'ordinary-untracked') fs.writeFileSync(path.join(repoPath, 'work.txt'), 'unsaved work');
+        if (scenario === 'nested-agent-config') {
+          fs.mkdirSync(path.join(repoPath, 'src', '.codex'), { recursive: true });
+          fs.writeFileSync(path.join(repoPath, 'src', '.codex', 'work.txt'), 'unsaved work');
+        }
+        if (scenario === 'tracked-agent-config') {
+          execFileSync('git', ['add', '.codex/config.json'], { cwd: repoPath, stdio: 'ignore' });
+        }
+        const { commandRunner } = createRunnerWithGh(repoPath, {
+          stdout: JSON.stringify([{ number: 42, headRefOid: head }]),
+        });
+        const services = createMergedServices({ ...session, worktreePath: repoPath }, commandRunner);
+        const registry = createRegistry(services);
+        const sessionsDelete = registerSessionsDeleteStub(registry, services);
+
+        const result = await registry.invoke('runpane:panes:archive', [{ paneId: session.id, dryRun: true }]);
+
+        expect(sessionsDelete).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          wouldArchive: scenario === 'agent-config-only',
+          safetyCheck: {
+            hasUntrackedFiles: scenario === 'ordinary-untracked' || scenario === 'nested-agent-config',
+            hasUncommittedChanges: scenario === 'tracked-agent-config',
+            unpushedCommits: 0,
+          },
+        });
       });
 
       it('treats an upstream deleted on the remote as gone and archives with merged PR evidence', async () => {
@@ -6735,7 +7018,10 @@ describe('runpane IPC handlers', () => {
     });
 
     describe('--session --merged', () => {
-      function createBulkServices(panes: Session[], associations: string[]) {
+      type PrLookup = Awaited<ReturnType<AppServices['gitStatusManager']['lookupPrForPane']>>;
+      const merged: PrLookup = { ok: true, pr: { prNumber: 7, prState: 'MERGED' } };
+
+      function createBulkServices(panes: Session[], associations: string[], lookupPr: (paneId: string) => Promise<PrLookup> = async () => merged) {
         const byId = new Map(panes.map(pane => [pane.id, pane]));
         const get = vi.fn(async () => ({
           id: 'orchestration-1',
@@ -6748,32 +7034,98 @@ describe('runpane IPC handlers', () => {
           sessionManager: {
             ...createServices().sessionManager,
             getSession: vi.fn((paneId: string) => byId.get(paneId)),
-            getProjectContext: vi.fn(() => ({ commandRunner: new CommandRunner({ path: os.tmpdir() }) })),
+          } as never,
+          // SAFETY: This test fixture reads each worktree's real upstream; the base branch is main.
+          worktreeManager: {
+            getUpstream: vi.fn(async (worktreePath: string) => {
+              try {
+                return execFileSync('git', ['rev-parse', '--abbrev-ref', '@{upstream}'], { cwd: worktreePath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+              } catch {
+                return null;
+              }
+            }),
+            getSessionLocalBaseBranch: vi.fn(async () => 'main'),
           } as never,
           // SAFETY: This test fixture intentionally supplies the minimal Sessions manager surface exercised by archive.
           orchestrationSessionManager: { get } as never,
+          // SAFETY: This test fixture supplies the PR lookup the bulk archive consults; by default every PR merged.
+          gitStatusManager: { lookupPrForPane: vi.fn(lookupPr), invalidatePrCache: vi.fn() } as never,
           archiveProgressManager: new ArchiveProgressManager(),
         } as never);
         return { services, get };
       }
 
-      function createBulkPanes(): Session[] {
-        const cleanRepo = createTempGitRepo('bulk-clean');
-        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: cleanRepo, stdio: 'ignore' });
-        const dirtyRepo = createTempGitRepo('bulk-dirty');
-        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: dirtyRepo, stdio: 'ignore' });
-        fs.writeFileSync(path.join(dirtyRepo, 'draft.txt'), 'unsaved work');
-        return [
-          { ...session, id: 'pane-clean', name: 'clean', worktreePath: cleanRepo },
-          { ...session, id: 'pane-dirty', name: 'dirty', worktreePath: dirtyRepo },
+      /** A repository whose main is on a bare remote, with one linked worktree per Pane. */
+      function createRemoteRepo() {
+        const repoPath = createTempGitRepo('bulk-repo');
+        const remotePath = path.join(path.dirname(repoPath), 'bulk-remote.git');
+        execFileSync('git', ['init', '--bare', '-q', remotePath], { stdio: 'ignore' });
+        execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], { cwd: repoPath, stdio: 'ignore' });
+        execFileSync('git', ['remote', 'add', 'origin', remotePath], { cwd: repoPath, stdio: 'ignore' });
+        execFileSync('git', ['push', '-q', '-u', 'origin', 'main'], { cwd: repoPath, stdio: 'ignore' });
+        const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+        const pane = (id: string, setup: (worktreePath: string) => void = () => {}): Session => {
+          const worktreePath = path.join(path.dirname(repoPath), id);
+          git(repoPath, 'worktree', 'add', '-q', '-b', id, worktreePath);
+          git(worktreePath, 'commit', '--allow-empty', '-m', `${id} work`);
+          git(worktreePath, 'push', '-q', '-u', 'origin', id);
+          setup(worktreePath);
+          return { ...session, id, name: id, worktreePath };
+        };
+        return { repoPath, git, pane };
+      }
+
+      it('archives a Pane only when its PR merged and its pushed worktree is clean', async () => {
+        const { git, pane } = createRemoteRepo();
+        const panes = [
+          pane('pane-merged'),
+          pane('pane-open'),
+          pane('pane-no-pr'),
+          pane('pane-closed'),
+          pane('pane-unknown'),
+          pane('pane-dirty', worktreePath => fs.writeFileSync(path.join(worktreePath, 'draft.txt'), 'unsaved work')),
+          pane('pane-unpushed', worktreePath => git(worktreePath, 'commit', '--allow-empty', '-m', 'local only')),
+        ];
+        const lookups = new Map<string, PrLookup>([
+          ['pane-open', { ok: true, pr: { prNumber: 2, prState: 'OPEN' } }],
+          ['pane-no-pr', { ok: true }],
+          ['pane-closed', { ok: true, pr: { prNumber: 4, prState: 'CLOSED' } }],
+          ['pane-unknown', { ok: false, error: new Error('gh auth') }],
+        ]);
+        const { services } = createBulkServices(panes, panes.map(p => p.id), async paneId => lookups.get(paneId) ?? merged);
+        const registry = createRegistry(services);
+        const sessionsDelete = registerSessionsDeleteStub(registry, services);
+
+        const result = await registry.invoke('runpane:panes:archive', [{ sessionId: 'refactor', merged: true }]);
+
+        expect(sessionsDelete).toHaveBeenCalledTimes(1);
+        expect(sessionsDelete).toHaveBeenCalledWith('pane-merged');
+        expect(result).toMatchObject({
+          ok: true,
+          archived: 1,
+          skipped: 6,
+          items: [
+            { paneId: 'pane-merged', outcome: 'archived', pr: { state: 'merged', number: 7 }, safetyCheck: { hasUpstream: true, unpushedCommits: 0 } },
+            { paneId: 'pane-open', outcome: 'skipped', pr: { state: 'open', number: 2 }, skipped: { code: 'pr-open', message: 'PR #2 is still open. Kept the Pane for its review, fix and QA tabs; rerun the sweep after the PR merges.' } },
+            { paneId: 'pane-no-pr', outcome: 'skipped', pr: { state: 'none' }, skipped: { code: 'pr-not-merged' } },
+            { paneId: 'pane-closed', outcome: 'skipped', pr: { state: 'closed', number: 4 }, skipped: { code: 'pr-not-merged' } },
+            { paneId: 'pane-unknown', outcome: 'skipped', pr: { state: 'unknown' }, skipped: { code: 'pr-status-unknown', message: expect.stringContaining('gh auth') } },
+            { paneId: 'pane-dirty', outcome: 'skipped', skipped: { code: 'uncommitted-changes', message: expect.stringContaining('runpane panes archive --pane pane-dirty --force') } },
+            { paneId: 'pane-unpushed', outcome: 'skipped', skipped: { code: 'unpushed-commits' }, safetyCheck: { unpushedCommits: 1 } },
+          ],
+        });
+        expect(JSON.stringify(result)).not.toContain('Rerun with --force');
+      });
+
+      it('dry-runs the Session archive, says what it would do, and reports a reason for every skipped Pane', async () => {
+        const { pane } = createRemoteRepo();
+        const panes = [
+          pane('pane-merged'),
+          pane('pane-no-pr'),
           { ...session, id: 'pane-archived', name: 'archived', archived: true },
           { ...session, id: 'pane-main', name: 'main', isMainRepo: true },
         ];
-      }
-
-      it('dry-runs the Session archive and reports a reason for every skipped Pane', async () => {
-        const panes = createBulkPanes();
-        const { services, get } = createBulkServices(panes, ['pane-clean', 'pane-dirty', 'pane-archived', 'pane-main', 'pane-missing', 'pane-clean']);
+        const { services, get } = createBulkServices(panes, ['pane-merged', 'pane-no-pr', 'pane-archived', 'pane-main', 'pane-missing', 'pane-merged'], async paneId => paneId === 'pane-no-pr' ? { ok: true } : merged);
         const registry = createRegistry(services);
         const sessionsDelete = registerSessionsDeleteStub(registry, services);
 
@@ -6791,8 +7143,8 @@ describe('runpane IPC handlers', () => {
           skipped: 4,
           failed: 0,
           items: [
-            { paneId: 'pane-clean', name: 'clean', outcome: 'would-archive', safetyCheck: { performed: true, unpushedCommits: 0 } },
-            { paneId: 'pane-dirty', outcome: 'skipped', skipped: { code: 'uncommitted-changes' }, safetyCheck: { hasUntrackedFiles: true } },
+            { paneId: 'pane-merged', name: 'pane-merged', outcome: 'would-archive', pr: { state: 'merged', number: 7 } },
+            { paneId: 'pane-no-pr', outcome: 'skipped', skipped: { code: 'pr-not-merged', message: expect.stringMatching(/^The Pane's branch has no PR yet\. Would keep the Pane;/) } },
             { paneId: 'pane-archived', outcome: 'skipped', skipped: { code: 'already-archived' } },
             { paneId: 'pane-main', outcome: 'skipped', skipped: { code: 'main-repo' } },
             { paneId: 'pane-missing', outcome: 'skipped', skipped: { code: 'missing-pane' } },
@@ -6800,24 +7152,78 @@ describe('runpane IPC handlers', () => {
         });
       });
 
-      it('archives only the safe Panes of the Session', async () => {
-        const panes = createBulkPanes();
-        const { services } = createBulkServices(panes, ['pane-clean', 'pane-dirty']);
+      it('keeps work written while the PR lookup is in flight', async () => {
+        const { pane } = createRemoteRepo();
+        const racing = pane('pane-racing');
+        const draft = path.join(racing.worktreePath, 'draft.txt');
+        const { services } = createBulkServices([racing], [racing.id], async () => {
+          fs.writeFileSync(draft, 'written during the lookup');
+          return merged;
+        });
         const registry = createRegistry(services);
         const sessionsDelete = registerSessionsDeleteStub(registry, services);
 
         const result = await registry.invoke('runpane:panes:archive', [{ sessionId: 'refactor', merged: true }]);
 
-        expect(sessionsDelete).toHaveBeenCalledTimes(1);
-        expect(sessionsDelete).toHaveBeenCalledWith('pane-clean');
+        expect(sessionsDelete).not.toHaveBeenCalled();
+        expect(fs.existsSync(draft)).toBe(true);
+        expect(result).toMatchObject({ archived: 0, items: [{ paneId: 'pane-racing', outcome: 'skipped', skipped: { code: 'uncommitted-changes' }, safetyCheck: { hasUntrackedFiles: true } }] });
+      });
+
+      it('keeps a detached worktree whose HEAD is the stored start commit but on no remote or base branch', async () => {
+        const { repoPath, git, pane } = createRemoteRepo();
+        const detached = pane('pane-detached', worktreePath => {
+          git(worktreePath, 'commit', '--allow-empty', '-m', 'unpublished');
+          git(worktreePath, 'checkout', '-q', '--detach');
+        });
+        const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: detached.worktreePath, encoding: 'utf8' }).trim();
+        const { services } = createBulkServices([{ ...detached, baseCommit: head }], [detached.id]);
+        // The real repo, so the merged-PR lookup runs the real `gh` and cleanup proves it left the worktree free.
+        // SAFETY: This test fixture supplies the project context archive reads.
+        vi.mocked(services.sessionManager.getProjectContext).mockReturnValue({ project: { ...project, path: repoPath }, commandRunner: new CommandRunner({ path: repoPath }) } as never);
+        const registry = createRegistry(services);
+        const sessionsDelete = registerSessionsDeleteStub(registry, services);
+
+        const result = await registry.invoke('runpane:panes:archive', [{ paneId: detached.id }]);
+
+        expect(sessionsDelete).not.toHaveBeenCalled();
         expect(result).toMatchObject({
-          ok: true,
-          archived: 1,
-          skipped: 1,
-          items: [
-            { paneId: 'pane-clean', outcome: 'archived', worktreeCleanup: 'completed' },
-            { paneId: 'pane-dirty', outcome: 'skipped', skipped: { code: 'uncommitted-changes' } },
-          ],
+          ok: false,
+          blocked: { code: 'unpushed-commits', safetyCheck: { hasUpstream: false, unpushedCommits: 1, unpushedCommitDetails: [{ sha: head, subject: 'unpublished' }] } },
+        });
+      });
+
+      it.each([
+        ['its own commit', (head: string) => head],
+        ['a revision expression', () => 'HEAD^0'],
+      ])('keeps a detached worktree whose stored base is %s rather than a branch', async (_label, storedBase) => {
+        const { repoPath, git, pane } = createRemoteRepo();
+        const detached = pane('pane-detached', worktreePath => {
+          git(worktreePath, 'commit', '--allow-empty', '-m', 'unpublished');
+          git(worktreePath, 'checkout', '-q', '--detach');
+        });
+        const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: detached.worktreePath, encoding: 'utf8' }).trim();
+        const stored: Session = { ...detached, baseBranch: storedBase(head), baseCommit: head };
+        const commandRunner = new CommandRunner({ path: repoPath });
+        // SAFETY: This test fixture supplies the session surface archive reads; the worktree manager is the real one.
+        const services = createServices({
+          sessionManager: {
+            ...createServices().sessionManager,
+            getSession: vi.fn(() => stored),
+            getProjectContext: vi.fn(() => ({ project: { ...project, path: repoPath }, commandRunner })),
+          } as never,
+          worktreeManager: new WorktreeManager(),
+          archiveProgressManager: new ArchiveProgressManager(),
+        } as never);
+        const registry = createRegistry(services);
+        const sessionsDelete = registerSessionsDeleteStub(registry, services);
+
+        const result = await registry.invoke('runpane:panes:archive', [{ paneId: stored.id }]);
+
+        expect(sessionsDelete).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          ok: false,
+          blocked: { code: 'unpushed-commits', safetyCheck: { hasUpstream: false, unpushedCommits: 1, unpushedCommitDetails: [{ sha: head, subject: 'unpublished' }] } },
         });
       });
 
@@ -6907,7 +7313,7 @@ describe('runpane IPC handlers', () => {
       }]);
 
       expect(window.restore).toHaveBeenCalledTimes(1);
-      expect(panelManager.setActivePanel).toHaveBeenCalledWith(session.id, terminalPanel.id);
+      expect(panelManager.rememberActivePanel).toHaveBeenCalledWith(session.id, terminalPanel.id);
       expect(window.show).toHaveBeenCalledTimes(1);
       expect(window.focus).toHaveBeenCalledTimes(1);
       expect(sentEvents).toHaveBeenCalledWith('pane:focus-requested', {
@@ -6929,6 +7335,27 @@ describe('runpane IPC handlers', () => {
 
       expect(sentEvents).toHaveBeenCalledWith('pane:focus-requested', { paneId: session.id, panelId: undefined });
       expect(result).toMatchObject({ ok: true, paneId: session.id });
+    });
+
+    it.each([
+      [{ focus: true }, true],
+      [{ source: 'agent' }, false],
+      [{}, false],
+    ])('panes create %o asks the host desktop to switch: %s', async (flags, switches) => {
+      vi.mocked(panelManager.createPanel).mockResolvedValue(terminalPanel);
+      const services = createServices({
+        // SAFETY: This test fixture intentionally supplies the minimal structural substitute exercised by the unit.
+        taskQueue: { ...idleSetupQueue(), createSessionAndWait: vi.fn(async () => ({ sessionId: session.id })) } as never,
+      });
+
+      await createRegistry(services).invoke('runpane:panes:create', [{
+        repo: 'active',
+        ...flags,
+        panes: [{ name: 'new-pane', tool: { command: 'bash' } }],
+      }]);
+
+      const focusRequests = sentEvents.mock.calls.filter(([channel]) => channel === 'pane:focus-requested');
+      expect(focusRequests).toEqual(switches ? [['pane:focus-requested', { paneId: session.id, panelId: terminalPanel.id }]] : []);
     });
 
     it('refuses to focus an archived pane and never touches the window', async () => {
@@ -6962,7 +7389,7 @@ describe('runpane IPC handlers', () => {
 
       await expect(registry.invoke('runpane:panes:focus', [{
         paneId: 'no-such-pane',
-      }])).rejects.toThrow(/No Pane pane found/);
+      }])).rejects.toThrow(/No Pane found/);
 
       expect(window.show).not.toHaveBeenCalled();
       expect(sentEvents).not.toHaveBeenCalled();
@@ -7099,7 +7526,7 @@ describe('runpane IPC handlers', () => {
       await expect(registry.invoke('runpane:locks:acquire', [{ name: 'x', ttlMs: 60_000, owner: {} }]))
         .rejects.toThrow(/pass --note/);
       await expect(registry.invoke('runpane:locks:acquire', [{ name: 'x', ttlMs: 60_000, owner: { paneId: 'missing' } }]))
-        .rejects.toThrow(/No Pane pane found/);
+        .rejects.toThrow(/No Pane found/);
       await expect(registry.invoke('runpane:locks:acquire', [{ name: 'x', ttlMs: 60_000, owner: { paneId: session.id, panelId: otherPanel.id } }]))
         .rejects.toThrow(/does not belong to Pane/);
       await expect(registry.invoke('runpane:locks:acquire', [{ name: 'bad name', ttlMs: 60_000, owner: { label: 'me' } }]))
@@ -7303,7 +7730,7 @@ describe('runpane IPC handlers', () => {
       const result = await registry.invoke('runpane:panels:open', [{ paneId: session.id, url: 'http://localhost:3000' }]);
 
       expect(panelManager.createPanel).not.toHaveBeenCalled();
-      expect(panelManager.setActivePanel).toHaveBeenCalledWith(session.id, 'existing-browser');
+      expect(panelManager.setActivePanel).toHaveBeenCalledWith(session.id, 'existing-browser', 'split');
       // Reopening stamps the tab so an open page reloads with the latest content.
       expect(panelManager.updatePanel).toHaveBeenCalledWith('existing-browser', expect.objectContaining({
         state: expect.objectContaining({ isActive: true, customState: expect.objectContaining({ currentUrl: 'http://localhost:3000/', reopenedAt: expect.any(String) }) }),

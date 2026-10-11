@@ -14,6 +14,7 @@ import { SpotlightManager } from '../services/spotlightManager';
 import { PermissionIpcServer } from '../services/permissionIpcServer';
 import { WorktreeManager } from '../services/worktreeManager';
 import { CliManagerFactory } from '../services/cliManagerFactory';
+import { CliToolRegistry } from '../services/cliToolRegistry';
 import type { AbstractCliManager } from '../services/panels/cli/AbstractCliManager';
 import { GitDiffManager } from '../services/gitDiffManager';
 import { GitStatusManager } from '../services/gitStatusManager';
@@ -32,11 +33,13 @@ import { PaneDaemonServer } from './server';
 import { PaneRemoteHttpApiServer } from './httpApiServer';
 import { PaneRemoteTransportController } from './remoteTransportController';
 import { PaneWorkspaceHostController } from './workspaceHost';
+import { runRemoteSetupCommand } from './remote-setup-command';
 import { RemoteHostTailnetMonitor } from './remoteHostTailnet';
 import { registerWorkspaceCommands } from '../ipc/workspace';
 import { getMobilePushSender } from './mobilePushSender';
 import { createFanoutEventSink, noopPaneEventSink, type PaneEventSink } from '../core/eventSink';
 import {
+  getPaneEventSink,
   setPaneRuntime,
   type PaneWebviewContext,
   type PtyHostRuntime,
@@ -49,6 +52,10 @@ import type { PaneCommandRegistry } from './commandRegistry';
 import { syncRemoteTransportForMode } from './remoteTransportStartup';
 import { panelManager } from '../services/panelManager';
 import { terminalPanelManager } from '../services/terminalPanelManager';
+import { createListeningPortMonitor } from '../services/listeningPorts';
+import type { ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
+import { PhonePreviewHost } from './phonePreviews';
+import { createPreviewFiles } from './previewProxy';
 import { WorkspaceJournal } from '../services/workspaceJournal';
 import { SessionPrMonitor } from '../services/sessionPrMonitor';
 import { NamedLockService } from '../services/namedLockService';
@@ -358,16 +365,52 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
   };
 
   const commandRegistry = registerIpcHandlers(services);
+  const listeningPortMonitor = createListeningPortMonitor({
+    // Terminal panels and agent CLIs (Claude, Codex) both run PTYs inside a Pane.
+    terminalPanes: () => [terminalPanelManager, ...CliToolRegistry.getInstance().getAllManagers()].flatMap(manager =>
+      [...manager.getSessionPids()].flatMap(([sessionId, pids]) => {
+        const paneName = sessionManager.getSession(sessionId)?.name ?? '';
+        return pids.map(pid => ({ pid, sessionId, paneName }));
+      })),
+    onChange: snapshot => {
+      latestPorts = snapshot;
+      publishPorts();
+      void phonePreviews.update(snapshot);
+    },
+  });
+  // Every listed port is forwarded to signed-in clients, Pane's own included.
+  const isForwardedPort = (port: number) => listeningPortMonitor.snapshot().ports.some(listed => listed.port === port);
   // On by default only for the desktop Pane that owns ~/.pane; other data dirs opt in through config.
   const workspaceHost = new PaneWorkspaceHostController(
     commandRegistry,
     configManager,
     mode === 'desktop' && path.resolve(getAppDirectory()) === path.join(os.homedir(), '.pane'),
+    runRemoteSetupCommand,
+    isForwardedPort,
   );
   registerWorkspaceCommands(commandRegistry, workspaceHost, configManager, options.app.getVersion());
+  const phonePreviews = new PhonePreviewHost({
+    workspace: workspaceHost,
+    paneDir: getAppDirectory(),
+    files: createPreviewFiles({
+      getPanel: panelId => panelManager.getPanel(panelId),
+      resolvePath: async (sessionId, filePath) => decodeBoundary(
+        await commandRegistry.invoke('file:getPath', [{ sessionId, filePath }]),
+        boundary.object({ success: boundary.literal(true), path: boundary.string }),
+      ).path,
+    }),
+    onChange: () => publishPorts(),
+  });
+  let latestPorts: ListeningPortsSnapshot | null = null;
+  const publishPorts = () => {
+    if (latestPorts) getPaneEventSink().send('ports:changed', phonePreviews.decorate(latestPorts));
+  };
+  commandRegistry.register('ports:list', async () => phonePreviews.decorate(await listeningPortMonitor.refresh()));
+  // A phone opening a web port; its address arrives with the next ports:changed.
+  commandRegistry.register('ports:phone-address', async (port: number) => { await phonePreviews.request(port); });
 
   let paneDaemonServer: PaneDaemonServer | null = null;
-  const remoteTransportController = new PaneRemoteTransportController(commandRegistry, configManager, analyticsManager);
+  const remoteTransportController = new PaneRemoteTransportController(commandRegistry, configManager, analyticsManager, isForwardedPort);
   const remoteHostTailnetMonitor = new RemoteHostTailnetMonitor(configManager);
   try {
     paneDaemonServer = new PaneDaemonServer(commandRegistry, getAppDirectory());
@@ -391,6 +434,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
   }
 
   void workspaceHost.start();
+  void phonePreviews.start().catch(error => console.warn('[Pane phone previews] Failed to start:', error));
   if (startRemoteTransport) {
     void remoteHostTailnetMonitor.start();
   }
@@ -420,6 +464,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
 
   gitStatusManager.startPolling();
   sessionPrMonitor.start();
+  listeningPortMonitor.start();
   if (mode === 'desktop') {
     versionChecker.startPeriodicCheck();
   }
@@ -456,6 +501,7 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
       // Before terminals stop: their exits during shutdown must not release locks.
       namedLockService.dispose();
       resourceMonitorService.stop();
+      listeningPortMonitor.stop();
       await spotlightManager.disableAll();
       await sessionManager.cleanup();
       await runCommandManager.stopAllRunCommands();
@@ -468,7 +514,9 @@ export async function createPaneDaemonHost(options: PaneDaemonHostOptions): Prom
       await permissionIpcServer?.stop();
       remoteHostTailnetMonitor.stop();
       await remoteTransportController.stopWatchingAndShutdown();
+      // The workspace handler first: phone handler removal can use up the rest of the budget.
       await workspaceHost.shutdown();
+      await phonePreviews.shutdown();
       if (paneDaemonServer) {
         await paneDaemonServer.stop();
       }

@@ -144,6 +144,8 @@ export interface AppConfig {
   // isolation. On by default on Windows. Requires app restart; the supervisor is forked
   // once at `app.whenReady`.
   usePtyHost?: boolean;
+  // Experimental: show Mission Control, the grid of every agent pane (off by default).
+  missionControlEnabled?: boolean;
   // PostHog analytics settings
   analytics?: AnalyticsConfig;
   // User-defined custom commands for the Add Tool picker
@@ -151,6 +153,7 @@ export interface AppConfig {
   defaultSessionCommand?: string;
   defaultSessionResume?: CustomCommandResume | null;
   defaultSessionProfile?: string;
+  defaultSessionPinned?: boolean;
   // Terminal shortcuts — hotkey-triggered clipboard paste snippets
   terminalShortcuts?: TerminalShortcut[];
   // Whether Pane intercepts application keyboard shortcuts
@@ -206,11 +209,14 @@ export interface UpdateConfigRequest {
   agentContext?: AppConfig['agentContext'];
   useInteractiveMode?: boolean;
   usePtyHost?: boolean;
+  // Experimental: show Mission Control, the grid of every agent pane (off by default).
+  missionControlEnabled?: boolean;
   analytics?: AnalyticsConfig;
   customCommands?: CustomCommand[];
   defaultSessionCommand?: string;
   defaultSessionResume?: CustomCommandResume | null;
   defaultSessionProfile?: string;
+  defaultSessionPinned?: boolean;
   terminalShortcuts?: TerminalShortcut[];
   keyboardShortcutsEnabled?: boolean;
   commandPaletteShortcutEnabled?: boolean;

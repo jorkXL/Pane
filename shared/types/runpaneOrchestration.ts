@@ -507,6 +507,8 @@ export interface RunpanePaneCreateSuccessItem {
   promptFile?: string;
   warnings?: RunpanePromptWarning[];
   association?: RunpanePaneAssociationOutcome;
+  /** Set when the Pane's setup waits for a slot; its agent starts after setup, so there is no panel yet. */
+  setupQueue?: { position: number; message: string };
 }
 
 /** Automatic Session association for a created or adopted Pane; failure never undoes the Pane. */
@@ -639,7 +641,7 @@ export interface RunpanePaneArchiveRequest {
 /** Archives every Pane associated with a named Session whose work is safe to discard locally. */
 export interface RunpanePaneArchiveBulkRequest {
   sessionId: string;
-  /** The only bulk filter today: Panes that are clean and pushed, or merged via a pull request. */
+  /** The only bulk filter today: Panes whose PR merged and whose worktree has no unsaved work. */
   merged: true;
   source?: RunpanePanelCreateSource;
   dryRun?: boolean;
@@ -748,7 +750,16 @@ export type RunpanePaneArchiveBulkSkipCode =
   | RunpanePaneArchiveBlockCode
   | 'missing-pane'
   | 'already-archived'
-  | 'main-repo';
+  | 'main-repo'
+  | 'pr-open'
+  | 'pr-not-merged'
+  | 'pr-status-unknown';
+
+/** The Pane's PR by its branch; a `--merged` sweep archives only `merged`. */
+export type RunpanePaneArchivePrStatus =
+  | { state: 'open' | 'merged' | 'closed'; number: number }
+  | { state: 'none' }
+  | { state: 'unknown'; reason: string };
 
 export interface RunpanePaneArchiveBulkItem {
   paneId: string;
@@ -756,6 +767,7 @@ export interface RunpanePaneArchiveBulkItem {
   outcome: 'archived' | 'would-archive' | 'skipped' | 'failed';
   skipped?: { code: RunpanePaneArchiveBulkSkipCode; message: string };
   error?: string;
+  pr?: RunpanePaneArchivePrStatus;
   safetyCheck?: RunpanePaneArchiveSafetyCheck;
   worktreeCleanup?: RunpaneWorktreeCleanupState;
   trashDeletion?: RunpaneWorktreeTrashDeletion;

@@ -72,7 +72,12 @@ Images, PDFs, fonts, video and audio load through `pane-media`, registered in
 `main/src/services/mediaPreview.ts`. A revocable URL grants access to one file;
 each request rechecks the existing worktree/symlink boundary through
 `file:getPath`. `mediaStream.ts` streams byte ranges from disk. File bodies do
-not pass through text/base64 IPC. Remote-host previews show an unavailable notice.
+not pass through text/base64 IPC. On a remote desktop, the URL is bound to the
+connected host, and each request streams from the host's authenticated `/media`
+route with the same boundary check and byte ranges. Archive and SQLite listings
+(`file:preview-list`) run on the host. "Open with system app" on a remote desktop
+copies the file to a temporary folder on that desktop and opens the copy;
+"Reveal in folder" appears only on the host.
 
 Markdown, HTML, CSV/TSV and structured text fetch at most 1 MiB. Markdown renders
 with a source toggle. HTML displays as read-only source, so markup, links and
@@ -179,6 +184,7 @@ destination instead of claiming delivery. There is no cross-machine sync.
 | Renderer updates | IPC events in `main/src/events.ts` | [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md) |
 | Timestamps | `main/src/utils/timestampUtils.ts` | [TIMESTAMP_HANDLING.md](TIMESTAMP_HANDLING.md) |
 | Pane Chat and orchestration sessions | `paneChatManager.ts`, `skillCacheManager.ts`, `paneChatBundle/` | [SESSIONS.md](SESSIONS.md) |
+| SSH hosts view | `sshConfigHosts.ts`, `ipc/sshHosts.ts`, `SshView.tsx` | [SSH_HOSTS.md](SSH_HOSTS.md) |
 | `runpane` CLI contract | `contracts/runpane/` | [RUNPANE_CLI_CONTRACT.md](RUNPANE_CLI_CONTRACT.md) |
 | Analytics | `analyticsManager.ts`, `frontend/src/services/posthog.ts` | [ANALYTICS_INVARIANTS.md](ANALYTICS_INVARIANTS.md) |
 | Themes | `frontend/src/styles/tokens/colors.css` | [APPEARANCE.md](APPEARANCE.md), [scripts/README.md](../scripts/README.md) |

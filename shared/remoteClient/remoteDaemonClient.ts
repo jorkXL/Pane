@@ -9,6 +9,7 @@ import {
 } from '../types/remoteDaemon';
 import { boundary, decodeBoundary, type JsonValue } from '../validation/boundaryDecoder';
 import { RemoteInputQueue } from '../remoteInputQueue';
+import { paneErrorText } from '../paneError';
 
 // Structural fetch types, so browser fetch, Node fetch and `expo/fetch` all fit.
 interface RemoteFetchInit {
@@ -120,6 +121,7 @@ const invokeResponseSchema = boundary.union(
     error: boundary.optional(boundary.object({
       message: boundary.optional(boundary.string),
       code: boundary.optional(boundary.string),
+      next: boundary.optional(boundary.string),
     })),
   }),
 );
@@ -138,8 +140,10 @@ const RETRYABLE_READ_CHANNELS = new Set([
   'sessions:get',
   'panels:list',
   'panels:getActive',
+  'panels:agent-statuses',
   'panels:checkInitialized',
   'panels:get-output',
+  'ports:list',
   'projects:list-branches',
   'projects:detect-branch',
   'remote:pwa-affordances',
@@ -265,7 +269,7 @@ export class RemoteDaemonClient {
 
         const message = payload?.ok
           ? `Remote request failed with ${response.status}`
-          : failure?.message ?? 'Remote request failed';
+          : paneErrorText({ message: failure?.message ?? 'Remote request failed', next: failure?.next });
         if (!isRetryableResponse(response.status)) {
           throw new RemoteRequestError(message, response.status, failure?.code ?? null);
         }

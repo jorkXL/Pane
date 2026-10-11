@@ -32,6 +32,7 @@ import type {
   CreatePanelRequest,
   PanelEventType,
   ResumableSession,
+  PanelActivationRequest,
   SessionPanelLayout,
   ToolPanel,
 } from '../../../shared/types/panels';
@@ -40,6 +41,7 @@ import type { PanelAgentStatusEvent } from '../../../shared/types/agentStatus';
 import type { DiffManifest, DiffScope, FileDiffRequest, FileDiffResult } from '../../../shared/types/gitDiff';
 import type { AgentUsageSnapshot } from '../../../shared/types/agentUsage';
 import type { PaneChatAgent, PaneChatState } from '../../../shared/types/paneChat';
+import type { SshHostList, SshHostOpenResult } from '../../../shared/types/sshHosts';
 import type {
   OrchestrationAssociationInput,
   OrchestrationSessionCreateInput,
@@ -52,11 +54,13 @@ import type {
 } from '../../../shared/types/orchestrationSession';
 import type { UsageIndexStatus, UsageReport, UsageReportRequest } from '../../../shared/types/usage';
 import type { LeaderboardResponse, LeaderboardStatus, LeaderboardSubmitResult } from '../../../shared/types/leaderboard';
+import type { MissionControlAgentPanel, MissionControlSnapshotRequest, MissionControlSnapshotResult } from '../../../shared/types/missionControl';
 import type { CreateSessionRequest } from './session';
 import type { DetectedProjectConfig } from '../../../shared/types/projectConfig';
 import type { RunpanePaneFocusRequestedEvent } from '../../../shared/types/runpaneOrchestration';
 import type { PaneLinkTarget } from '../../../shared/types/paneLinks';
 import type { ArchiveProgressSnapshot } from '../../../shared/types/archiveProgress';
+import type { ListeningPortsSnapshot } from '../../../shared/types/listeningPorts';
 import type { UpdateCapabilities } from '../../../shared/types/updater';
 import type {
   ProjectDashboardData,
@@ -153,6 +157,11 @@ interface ElectronAPI {
     setAgent: (agent: PaneChatAgent) => Promise<IPCResponse<PaneChatState<Session>>>;
   };
 
+  sshHosts: {
+    list: () => Promise<IPCResponse<SshHostList>>;
+    open: (alias: string, newTab: boolean) => Promise<IPCResponse<SshHostOpenResult>>;
+  };
+
   orchestrationSessions: {
     runtimes: () => Promise<IPCResponse<{ distributions: string[] }>>;
     list: () => Promise<IPCResponse<OrchestrationSessionListResult>>;
@@ -186,6 +195,12 @@ interface ElectronAPI {
   export: {
     saveImage: (data: string, defaultFilename: string) => Promise<IPCResponse<{ filePath: string } | null>>;
     shareImage: (data: string, filename: string) => Promise<IPCResponse<{ method: 'share' | 'clipboard' }>>;
+  };
+
+  // Mission Control — every agent pane across all sessions
+  missionControl: {
+    listAgents: (options?: { includeArchived?: boolean }) => Promise<IPCResponse<MissionControlAgentPanel[]>>;
+    snapshots: (request: MissionControlSnapshotRequest) => Promise<IPCResponse<MissionControlSnapshotResult>>;
   };
 
   // Session management
@@ -405,16 +420,25 @@ interface ElectronAPI {
       sessionSortAscending: boolean;
       pinnedSectionExpanded: boolean;
       repositoriesSectionExpanded: boolean;
+      sshHostsSectionExpanded: boolean;
+      sessionsSectionExpanded: boolean;
+      collapsedSessions: string[];
+      archivedSectionExpanded: boolean;
+      expandedArchivedProjects: number[];
     }>>;
     saveExpanded: (projectIds: number[], folderIds: string[]) => Promise<IPCResponse>;
     saveExpandedProjects: (projectIds: number[]) => Promise<IPCResponse>;
     saveExpandedFolders: (folderIds: string[]) => Promise<IPCResponse>;
     saveSessionSortAscending: (ascending: boolean) => Promise<IPCResponse>;
-    saveSidebarSectionExpanded: (section: 'pinned' | 'repositories', expanded: boolean) => Promise<IPCResponse>;
+    saveSidebarSectionExpanded: (section: 'pinned' | 'repositories' | 'sshHosts' | 'sessions' | 'archived', expanded: boolean) => Promise<IPCResponse>;
+    saveCollapsedSessions: (sessionIds: string[]) => Promise<IPCResponse>;
+    saveExpandedArchivedProjects: (projectIds: number[]) => Promise<IPCResponse>;
     getNavigationMemory: (hostId: string | null) => Promise<IPCResponse<HostNavigationMemory | null>>;
     saveNavigationMemory: (hostId: string | null, memory: HostNavigationMemory) => Promise<IPCResponse>;
     getSessionWorkspaceLayout: (hostId: string | null) => Promise<IPCResponse<SessionWorkspaceLayout | null>>;
     saveSessionWorkspaceLayout: (hostId: string | null, layout: SessionWorkspaceLayout | null) => Promise<IPCResponse>;
+    getPaneLayout: (hostId: string | null, paneId: string) => Promise<IPCResponse<SessionPanelLayout | null>>;
+    savePaneLayout: (hostId: string | null, paneId: string, layout: SessionPanelLayout | null) => Promise<IPCResponse>;
   };
 
   // Event listeners for real-time updates
@@ -426,6 +450,7 @@ interface ElectronAPI {
     onSessionUpdated: (callback: (session: Session) => void) => () => void;
     onPaneFocusRequested: (callback: (data: RunpanePaneFocusRequestedEvent) => void) => () => void;
     onArchiveProgress: (callback: (progress: ArchiveProgressSnapshot) => void) => () => void;
+    onListeningPortsChanged: (callback: (snapshot: ListeningPortsSnapshot) => void) => () => void;
     onPaneOpenLink: (callback: (target: PaneLinkTarget) => void) => () => void;
     /** A phone or another window saved settings on this host; refetch the config. */
     onRemoteSettingsChanged: (callback: () => void) => () => void;
@@ -444,6 +469,7 @@ interface ElectronAPI {
     
     // Project events
     onProjectUpdated: (callback: (project: Project) => void) => () => void;
+    onProjectListChanged?: (callback: () => void) => () => void;
     
     // Folder events
     onFolderCreated: (callback: (folder: Folder) => void) => () => void;
@@ -451,6 +477,7 @@ interface ElectronAPI {
     onFolderDeleted: (callback: (folderId: string) => void) => () => void;
     
     // Panel events
+    onPanelActivationRequested: (callback: (request: PanelActivationRequest) => void) => () => void;
     onPanelCreated: (callback: (panel: ToolPanel) => void) => () => void;
     onPanelUpdated: (callback: (panel: ToolPanel) => void) => () => void;
     onPanelDeleted: (callback: (data: { panelId: string; sessionId: string }) => void) => () => void;

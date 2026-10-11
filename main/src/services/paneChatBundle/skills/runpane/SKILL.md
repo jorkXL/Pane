@@ -71,8 +71,19 @@ While one workstream waits, continue the others.
 
 - Each workstream has one implementation authority. It owns every source edit,
   fix commit, rebase, push, and PR update.
-- Review and QA run on every new head, in fresh panels or through the
-  `reviewer` and `qa-and-verify` subagents. They return findings and post
+- 1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA
+  for it are tabs in that Pane. A new Pane creates a worktree, so create one
+  only when the work's branch has no Pane yet. Every later agent for that
+  branch opens as a new agent tab in its Pane with
+  `runpane panels create --pane <id>`, never as a new Pane. Before
+  `runpane panes create`, find the work's Pane with
+  `runpane panes list --repo <repo> --json`, matching the PR's head branch (`gh pr view <n> --json headRefName`) against `git -C <worktreePath> branch --show-current`.
+- Tabs share one checkout. Only the implementation authority changes the
+  branch or HEAD; review, audit and QA tabs never run `git checkout`, `reset`
+  or `stash`.
+- Review and QA run on every new head, in fresh agent tabs in the feature's
+  Pane. Use the `reviewer` and `qa-and-verify` subagents only when the user
+  asks for a private review. They return findings and post
   nothing. QA may run authorized tests and upload evidence under a grant, and it
   returns code defects to the implementation authority.
 - Only the implementation authority posts to GitHub (review replies, thread
@@ -81,7 +92,7 @@ While one workstream waits, continue the others.
 - Create panes and panels in the background with `--source agent` and
   `--no-focus` where supported. Check the returned focus state. If a pane
   steals focus anyway, report it with `runpane doctor --report`.
-- For work on a named branch,
+- For a new feature on a named branch,
   `runpane panes create --base <ref> --branch <name> --prompt-file <file>`
   replaces `git worktree add` plus `panes adopt`. Pane creates the worktree on
   exactly that branch, slashes included, and fails if the branch already
@@ -300,8 +311,10 @@ authorization.
 Archiving removes a Pane's worktree, so it needs the user's cleanup approval.
 Once PRs merge, preview with
 `runpane panes archive --session <id|name> --merged --dry-run --json`, then
-rerun with `--yes`. It archives only Panes that are clean and pushed, or whose
-branch merged through a PR whose head is `HEAD` (`safetyCheck.mergedViaPr`),
-and gives every other Pane a `skipped.code`. Adopted worktrees are kept unless
+rerun with `--yes`. It archives only Panes whose PR is merged and whose
+worktree has no uncommitted, untracked or unpushed work. It keeps a Pane with
+an open PR (`pr-open`), no PR or a closed unmerged one (`pr-not-merged`), or a
+PR state GitHub can't confirm (`pr-status-unknown`), and gives every other
+kept Pane a `skipped.code` with the next step. Adopted worktrees are kept unless
 you add `--remove-worktree`. Local branches are always kept. Never add
 `--force` to discard work without the user's approval.

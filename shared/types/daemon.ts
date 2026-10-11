@@ -21,9 +21,11 @@ export interface PaneDaemonSuccessResponseFrame {
   result?: JsonValue;
 }
 
+/** What happened and why in `message`; the step to take in `next`. See shared/paneError.ts. */
 export interface PaneDaemonError {
   message: string;
   code?: string;
+  next?: string;
 }
 
 export interface PaneDaemonErrorResponseFrame {
@@ -68,6 +70,7 @@ const responseFrameSchema: BoundarySchema<PaneDaemonResponseFrame> = boundary.un
     error: boundary.object({
       message: boundary.string,
       code: boundary.optional(boundary.string),
+      next: boundary.optional(boundary.string),
     }),
   }),
 );
@@ -87,14 +90,17 @@ export const DAEMON_OWNED_CHANNEL_PREFIXES = [
   'folders:',
   'logs:',
   'mobile:',
+  'mission-control:',
   'panels:',
   'pane-chat:',
+  'ports:',
   'orchestration-sessions:',
   'projects:',
   'prompts:',
   'resource-monitor:',
   'runpane:',
   'sessions:',
+  'ssh-hosts:',
   'terminal:',
   'usage:',
   'voice:',
@@ -124,6 +130,7 @@ export const DAEMON_OWNED_EXACT_CHANNELS = [
   'file:duplicate',
   'file:exists',
   'file:getPath',
+  'file:preview-list',
   'file:list',
   'file:move',
   'file:read',

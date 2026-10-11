@@ -6,6 +6,7 @@ import type {
   OrchestrationSessionView,
 } from '../../../../shared/types/orchestrationSession';
 import type { ToolPanel } from '../../../../shared/types/panels';
+import type { ListeningPortsSnapshot } from '../../../../shared/types/listeningPorts';
 import type { RemoteDaemonEventEnvelope, RemotePaneConnectionProfile, RemotePwaAffordances } from '../../../../shared/types/remoteDaemon';
 import type {
   VoiceDeepgramTokenResult,
@@ -27,6 +28,17 @@ export interface RemoteBranchInfo {
   hasWorktree: boolean;
   isRemote: boolean;
 }
+
+/** One entry of a worktree folder; `path` is relative to the worktree, in the host's separators. */
+export interface RemoteFileEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size?: number;
+}
+
+/** The `file:*` commands answer `{ success, error, ...result }` instead of the `{ success, data }` envelope. */
+type FileCommandResult<T> = T & { success: boolean; error?: string };
 
 export interface RemoteCreateSessionResult {
   jobId?: string;
@@ -191,6 +203,46 @@ export class RemoteRuntimeAdapter {
     }]);
   }
 
+  createBrowserPanel(sessionId: string): Promise<ToolPanel> {
+    return this.invoke<ToolPanel>('panels:create', [{ sessionId, type: 'browser', title: 'Browser' }]);
+  }
+
+  updatePanelState(panelId: string, state: ToolPanel['state']): Promise<void> {
+    return this.invoke<void>('panels:update', [panelId, { state }]);
+  }
+
+  /** Asks the host for a web port's phone address; it arrives with the next ports:changed. */
+  requestPhoneAddress(port: number): Promise<void> {
+    return this.invoke<void>('ports:phone-address', [port]);
+  }
+
+  getListeningPorts(): Promise<ListeningPortsSnapshot> {
+    return this.invoke<ListeningPortsSnapshot>('ports:list');
+  }
+
+  /** A folder of the pane's worktree, folders first; '' is the worktree itself. */
+  async listFiles(sessionId: string, path: string): Promise<RemoteFileEntry[]> {
+    return (await this.invokeFileCommand<{ files: RemoteFileEntry[] }>('file:list', [{ sessionId, path }])).files;
+  }
+
+  /** A worktree file's text, or null when the host finds it binary. */
+  async readTextFile(sessionId: string, filePath: string): Promise<string | null> {
+    const result = await this.client.invoke<FileCommandResult<{ content?: string; binary?: boolean }>>('file:read', [{ sessionId, filePath }]);
+    if (result.binary) return null;
+    if (!result.success) throw new Error(result.error ?? 'Could not read the file');
+    return result.content ?? '';
+  }
+
+  async writeTextFile(sessionId: string, filePath: string, content: string): Promise<void> {
+    await this.invokeFileCommand('file:write', [{ sessionId, filePath, content }]);
+  }
+
+  private async invokeFileCommand<T extends object = object>(channel: string, args: unknown[]): Promise<T> {
+    const result = await this.client.invoke<FileCommandResult<T>>(channel, args);
+    if (!result.success) throw new Error(result.error ?? `${channel} failed`);
+    return result;
+  }
+
   checkPanelInitialized(panelId: string): Promise<boolean> {
     return this.invoke<boolean>('panels:checkInitialized', [panelId]);
   }
@@ -219,8 +271,8 @@ export class RemoteRuntimeAdapter {
     return this.invoke<void>('terminal:setVisibility', [panelId, visible, viewerId]);
   }
 
-  ackTerminalOutput(panelId: string, bytes: number): Promise<void> {
-    return this.invoke<void>('terminal:ack', [panelId, bytes]);
+  ackTerminalOutput(panelId: string, bytes: number, viewerId: string): Promise<void> {
+    return this.invoke<void>('terminal:ack', [panelId, bytes, viewerId]);
   }
 }
 

@@ -311,6 +311,8 @@ interface PaneCreateSuccessItem {
   association?: { sessionId: string; ok: boolean; error?: string };
   promptFile?: string;
   warnings?: PromptWarning[];
+  /** Set when setup waits for a slot; the agent starts after setup, so there is no panel yet. */
+  setupQueue?: { position: number; message: string };
 }
 
 interface PaneCreateFailureItem {
@@ -545,8 +547,9 @@ interface PaneArchiveBulkItem {
   paneId: string;
   name?: string;
   outcome: 'archived' | 'would-archive' | 'skipped' | 'failed';
-  skipped?: { code: PaneArchiveBlockCode | 'missing-pane' | 'already-archived' | 'main-repo'; message: string };
+  skipped?: { code: PaneArchiveBlockCode | 'missing-pane' | 'already-archived' | 'main-repo' | 'pr-open' | 'pr-not-merged' | 'pr-status-unknown'; message: string };
   error?: string;
+  pr?: { state: 'open' | 'merged' | 'closed' | 'none' | 'unknown'; number?: number; reason?: string };
   safetyCheck?: PaneArchiveSafetyCheck;
   worktreeCleanup?: WorktreeCleanupState;
   trashDeletion?: WorktreeTrashDeletion;
@@ -1107,7 +1110,7 @@ const repoAddResultSchema: BoundarySchema<RepoAddResult> = boundary.object({
   repo: boundary.optional(repoSummarySchema),
   preview: boundary.optional(repoAddPreviewSchema),
 });
-const paneListResultSchema: BoundarySchema<PaneListResult> = boundary.object({
+export const paneListResultSchema: BoundarySchema<PaneListResult> = boundary.object({
   ok: boundary.literal(true),
   repo: boundary.optional(repoSummarySchema),
   panes: boundary.array(paneSummarySchema),
@@ -1390,6 +1393,10 @@ export const paneCreateResultSchema: BoundarySchema<PaneCreateResult> = boundary
       })),
       promptFile: boundary.optional(boundary.string),
       warnings: promptWarningsSchema,
+      setupQueue: boundary.optional(boundary.object({
+        position: boundary.number,
+        message: boundary.string,
+      })),
     }),
     boundary.object({
       ok: boundary.literal(false),
@@ -1465,10 +1472,18 @@ const paneArchiveBulkResultSchema: BoundarySchema<PaneArchiveBulkResult> = bound
         'missing-pane',
         'already-archived',
         'main-repo',
+        'pr-open',
+        'pr-not-merged',
+        'pr-status-unknown',
       ),
       message: boundary.string,
     })),
     error: boundary.optional(boundary.string),
+    pr: boundary.optional(boundary.object({
+      state: boundary.enumeration('open', 'merged', 'closed', 'none', 'unknown'),
+      number: boundary.optional(boundary.number),
+      reason: boundary.optional(boundary.string),
+    })),
     safetyCheck: boundary.optional(archiveSafetySchema),
     worktreeCleanup: boundary.optional(worktreeCleanupSchema),
     trashDeletion: boundary.optional(trashDeletionSchema),
@@ -1512,7 +1527,7 @@ export const panelListResultSchema: BoundarySchema<PanelListResult> = boundary.o
   paneId: boundary.string,
   panels: boundary.array(panelSummarySchema),
 });
-const panelCreateResultSchema: BoundarySchema<PanelCreateResult> = boundary.object({
+export const panelCreateResultSchema: BoundarySchema<PanelCreateResult> = boundary.object({
   ok: boundary.boolean,
   generation: boundary.optional(boundary.number),
   paneId: boundary.string,
@@ -2391,7 +2406,7 @@ async function runPanesArchiveSession(parsed: ParsedArgs, sessionId: string): Pr
   if (parsed.dryRun) request.dryRun = true;
   if (parsed.removeWorktree) request.removeWorktree = true;
 
-  await confirmPaneArchive(parsed, `Archive every merged or pushed Pane in Session ${sessionId}`);
+  await confirmPaneArchive(parsed, `Archive every Pane in Session ${sessionId} whose work is pushed and whose PR is not still open`);
 
   const result = await invokeDaemon('runpane:panes:archive', [request], paneArchiveBulkResultSchema, {
     paneDir: parsed.paneDir,
@@ -2902,7 +2917,7 @@ function keysToBytes(keys: string[]): string {
   }).join('');
 }
 
-async function buildPanelCreateRequest(parsed: ParsedArgs): Promise<PanelCreateRequest> {
+export async function buildPanelCreateRequest(parsed: ParsedArgs): Promise<PanelCreateRequest> {
   if (!parsed.paneId) {
     throw new Error('runpane panels create requires --pane.');
   }
@@ -3451,6 +3466,9 @@ function printPaneCreateResult(result: PaneCreateResult, dryRun = false, action:
           : `  Not associated with Session ${item.association.sessionId}: ${item.association.error ?? 'unknown error'}`);
       }
       printPromptNotes(item, '  ');
+      if (item.setupQueue) {
+        console.log(`  ${item.setupQueue.message}`);
+      }
       if (item.nextCommand) {
         console.log(`  Next: ${item.nextCommand}`);
       }
@@ -3495,7 +3513,7 @@ function printPaneArchiveBulkResult(result: PaneArchiveBulkResult): void {
     } else if (item.outcome === 'failed') {
       console.error(`  failed ${label}: ${item.error ?? 'unknown error'}`);
     } else {
-      const merged = item.safetyCheck?.mergedViaPr ? ` merged via PR #${item.safetyCheck.mergedViaPr.number}` : '';
+      const merged = item.pr?.state === 'merged' ? ` PR #${item.pr.number} merged` : '';
       const trash = item.trashDeletion === 'pending' ? ', files deleting in background' : '';
       const cleanup = item.worktreeCleanup ? ` worktree ${item.worktreeCleanup}${trash}` : '';
       console.log(`  ${item.outcome} ${label}${merged}${cleanup}`);

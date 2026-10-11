@@ -1,11 +1,14 @@
-import { ChevronDown, Plus, TerminalSquare } from 'lucide-react';
-import { useEffect, useId, useRef, useState } from 'react';
+import { ChevronDown, Globe, Plus, TerminalSquare } from 'lucide-react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { RemotePwaCustomCommand } from '../../../../shared/types/remoteDaemon';
 import type { ToolPanel } from '../../../../shared/types/panels';
 import { AGENT_LAUNCH_PRESETS } from '../../../../shared/constants/agentLaunchPresets';
 import { getCliBrandIcon } from '../../components/ui/brandIconRegistry';
+import { getPanelIcon } from '../../components/panels/panelIcon';
+import { PanelTabStatusDot } from '../../components/panels/PanelTabStatusDot';
 import { getRemotePanelTabId, getRemotePanelTabPanelId } from './remotePanelTabIds';
+import { phoneShows } from '../stores/remoteSessionStore';
 
 // The remote host executes these commands. Until its platform capabilities are
 // exposed here, the viewer's browser platform must not hide valid host tools.
@@ -23,15 +26,17 @@ interface RemotePanelTabsProps {
   customCommands: RemotePwaCustomCommand[];
   onSelectPanel: (panelId: string) => void;
   onCreateTerminal: (options?: RemoteTerminalCreateOptions) => void;
+  onCreateBrowser: () => void;
 }
 
 export function RemotePanelTabs({
-  panels,
+  panels: hostPanels,
   selectedPanelId,
   creating,
   customCommands,
   onSelectPanel,
   onCreateTerminal,
+  onCreateBrowser,
 }: RemotePanelTabsProps) {
   const [showAddMenu, setShowAddMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -39,6 +44,11 @@ export function RemotePanelTabs({
   const menuItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const addMenuId = useId();
+  // Tabs the phone can show come first; desktop-only panels follow, each group in host order.
+  const panels = useMemo(
+    () => [...hostPanels].sort((a, b) => Number(!phoneShows(a)) - Number(!phoneShows(b))),
+    [hostPanels],
+  );
 
   useEffect(() => {
     if (!showAddMenu) return;
@@ -132,7 +142,8 @@ export function RemotePanelTabs({
                 : 'border-border-secondary bg-surface-primary text-text-secondary hover:border-border-primary hover:bg-surface-hover hover:text-text-primary'
             }`}
           >
-            <TerminalSquare className="h-4 w-4 shrink-0" aria-hidden="true" />
+            {panel.type === 'terminal' && <PanelTabStatusDot panelId={panel.id} sessionId={panel.sessionId} />}
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden="true">{getPanelIcon(panel.type, panel, 'h-4 w-4')}</span>
             <span className="truncate">{panel.title}</span>
           </button>
         ))}
@@ -170,10 +181,20 @@ export function RemotePanelTabs({
               description="Start a shell on the remote host"
               onClick={() => addTerminal()}
             />
+            <AddToolMenuItem
+              buttonRef={(element) => { menuItemRefs.current[1] = element; }}
+              icon={<Globe className="h-4 w-4" />}
+              title="Browser"
+              description="Open the host's dev servers and pages"
+              onClick={() => {
+                onCreateBrowser();
+                setShowAddMenu(false);
+              }}
+            />
             {agentPresets.map((preset, presetIndex) => (
               <AddToolMenuItem
                 key={preset.id}
-                buttonRef={(element) => { menuItemRefs.current[presetIndex + 1] = element; }}
+                buttonRef={(element) => { menuItemRefs.current[presetIndex + 2] = element; }}
                 icon={getCliBrandIcon(preset.iconKey, 'h-4 w-4') ?? <TerminalSquare className="h-4 w-4" />}
                 title={preset.title}
                 description={`Run ${preset.command}`}
@@ -186,7 +207,7 @@ export function RemotePanelTabs({
             {customCommands.map((command, index) => (
               <AddToolMenuItem
                 key={`${command.name}-${index}`}
-                buttonRef={(element) => { menuItemRefs.current[index + 1 + agentPresets.length] = element; }}
+                buttonRef={(element) => { menuItemRefs.current[index + 2 + agentPresets.length] = element; }}
                 icon={getCliBrandIcon(command.command, 'h-4 w-4') ?? <TerminalSquare className="h-4 w-4" />}
                 title={command.name}
                 description={command.command}

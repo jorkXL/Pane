@@ -25,7 +25,7 @@ import type {
 import type { TailnetMachineList, WorkspaceAccessSummary, WorkspaceAccessUpdate } from '../../shared/types/workspaceAccess';
 import type { HostNavigationMemory } from '../../shared/types/hostNavigation';
 import type { SessionWorkspaceLayout } from '../../shared/types/sessionWorkspaceLayout';
-import type { ToolPanel } from '../../shared/types/panels';
+import type { PanelActivationRequest, SessionPanelLayout, ToolPanel } from '../../shared/types/panels';
 import type { DiffScope, FileDiffRequest } from '../../shared/types/gitDiff';
 import type { PanelAgentStatusEvent } from '../../shared/types/agentStatus';
 import type {
@@ -40,6 +40,7 @@ import type { SubmitFeedbackRequest } from '../../shared/types/feedback';
 import type { RunpanePaneFocusRequestedEvent } from '../../shared/types/runpaneOrchestration';
 import type { PaneLinkTarget } from '../../shared/types/paneLinks';
 import type { ArchiveProgressSnapshot } from '../../shared/types/archiveProgress';
+import type { ListeningPortsSnapshot } from '../../shared/types/listeningPorts';
 import type {
   PanePermissionRequest as PermissionRequest,
   PanePermissionResponse as PermissionResponse,
@@ -399,6 +400,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getOrCreate: (): Promise<IPCResponse> => invokeIpc('pane-chat:get-or-create'),
     setAgent: (agent: 'claude' | 'codex' | 'cursor'): Promise<IPCResponse> => invokeIpc('pane-chat:set-agent', agent),
   },
+  sshHosts: {
+    list: (): Promise<IPCResponse> => invokeIpc('ssh-hosts:list'),
+    open: (alias: string, newTab: boolean): Promise<IPCResponse> => invokeIpc('ssh-hosts:open', alias, newTab),
+  },
 
   orchestrationSessions: {
     runtimes: (): Promise<IPCResponse> => invokeIpc('orchestration-sessions:runtimes'),
@@ -435,6 +440,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       invokeIpc('export:save-image', data, defaultFilename),
     shareImage: (data: string, filename: string): Promise<IPCResponse> =>
       invokeIpc('export:share-image', data, filename),
+  },
+
+  // Mission Control — live overview of every agent pane across all sessions
+  missionControl: {
+    listAgents: (options?: { includeArchived?: boolean }): Promise<IPCResponse> => invokeIpc('mission-control:list-agents', options),
+    snapshots: (request: { panelIds: string[]; maxLines?: number }): Promise<IPCResponse> => invokeIpc('mission-control:snapshots', request),
   },
 
   // Session management
@@ -722,7 +733,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveExpandedProjects: (projectIds: number[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-projects', projectIds),
     saveExpandedFolders: (folderIds: string[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-folders', folderIds),
     saveSessionSortAscending: (ascending: boolean): Promise<IPCResponse> => invokeIpc('ui-state:save-session-sort-ascending', ascending),
-    saveSidebarSectionExpanded: (section: 'pinned' | 'repositories', expanded: boolean): Promise<IPCResponse> => invokeIpc('ui-state:save-sidebar-section-expanded', section, expanded),
+    saveSidebarSectionExpanded: (section: 'pinned' | 'repositories' | 'sshHosts' | 'sessions' | 'archived', expanded: boolean): Promise<IPCResponse> => invokeIpc('ui-state:save-sidebar-section-expanded', section, expanded),
+    saveCollapsedSessions: (sessionIds: string[]): Promise<IPCResponse> => invokeIpc('ui-state:save-collapsed-sessions', sessionIds),
+    saveExpandedArchivedProjects: (projectIds: number[]): Promise<IPCResponse> => invokeIpc('ui-state:save-expanded-archived-projects', projectIds),
     // Per-host navigation memory. The caller names the host because the renderer
     // can still be showing the outgoing host while main has switched runtimes.
     getNavigationMemory: (hostId: string | null): Promise<IPCResponse> => invokeIpc('ui-state:get-navigation-memory', hostId),
@@ -730,6 +743,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Per-host Session tiling, the layout counterpart of navigation memory.
     getSessionWorkspaceLayout: (hostId: string | null): Promise<IPCResponse> => invokeIpc('ui-state:get-session-workspace-layout', hostId),
     saveSessionWorkspaceLayout: (hostId: string | null, layout: SessionWorkspaceLayout | null): Promise<IPCResponse> => invokeIpc('ui-state:save-session-workspace-layout', hostId, layout),
+    // Per-host, per-Pane split and tabs this desktop last showed.
+    getPaneLayout: (hostId: string | null, paneId: string): Promise<IPCResponse> => invokeIpc('ui-state:get-pane-layout', hostId, paneId),
+    savePaneLayout: (hostId: string | null, paneId: string, layout: SessionPanelLayout | null): Promise<IPCResponse> => invokeIpc('ui-state:save-pane-layout', hostId, paneId, layout),
   },
 
   // Event listeners for real-time updates
@@ -764,6 +780,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       const wrappedCallback = (_event: Electron.IpcRendererEvent, progress: ArchiveProgressSnapshot) => callback(progress);
       ipcRenderer.on('archive:progress', wrappedCallback);
       return () => ipcRenderer.removeListener('archive:progress', wrappedCallback);
+    },
+    onListeningPortsChanged: (callback: (snapshot: ListeningPortsSnapshot) => void) => {
+      const wrappedCallback = (_event: Electron.IpcRendererEvent, snapshot: ListeningPortsSnapshot) => callback(snapshot);
+      ipcRenderer.on('ports:changed', wrappedCallback);
+      return () => ipcRenderer.removeListener('ports:changed', wrappedCallback);
     },
     onPaneOpenLink: (callback: (target: PaneLinkTarget) => void) => {
       const wrappedCallback = (_event: Electron.IpcRendererEvent, target: PaneLinkTarget) => callback(target);
@@ -837,8 +858,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('project:updated', wrappedCallback);
       return () => ipcRenderer.removeListener('project:updated', wrappedCallback);
     },
+    onProjectListChanged: (callback: () => void) => {
+      const wrappedCallback = () => callback();
+      ipcRenderer.on('project:list-changed', wrappedCallback);
+      return () => ipcRenderer.removeListener('project:list-changed', wrappedCallback);
+    },
     
     // Panel events
+    // The host or an agent brought a tab forward; act only when showing that Pane.
+    onPanelActivationRequested: (callback: (request: PanelActivationRequest) => void) => {
+      const wrappedCallback = (_event: Electron.IpcRendererEvent, request: PanelActivationRequest) => callback(request);
+      ipcRenderer.on('panel:activeChanged', wrappedCallback);
+      return () => ipcRenderer.removeListener('panel:activeChanged', wrappedCallback);
+    },
     onPanelCreated: (callback: (panel: ToolPanel) => void) => {
       const wrappedCallback = (_event: Electron.IpcRendererEvent, panel: ToolPanel) => callback(panel);
       ipcRenderer.on('panel:created', wrappedCallback);

@@ -13,6 +13,7 @@ import * as pty from '@lydell/node-pty';
 import { EventEmitter } from 'events';
 import { filterSyncBlockClears } from './syncBlockClearFilter';
 import { ToolPanel, TerminalPanelState } from '../../../shared/types/panels';
+import { MISSION_CONTROL_VIEWER_PREFIX } from '../../../shared/types/missionControl';
 import { getPaneDaemonEventSink, getPaneEventSink, getPtyHostRuntime, getRuntimeConfigManager, type PtyHandleLike, type PtyHostRuntime } from '../core/runtime';
 import { panelManager } from './panelManager';
 import * as path from 'path';
@@ -136,6 +137,14 @@ export interface TerminalPanelSnapshot {
   isCliReady?: boolean;
   agentType?: CliAgentType;
   agentSessionId?: string;
+  /**
+   * Live PTY dimensions. A secondary viewer must render at exactly these
+   * dimensions: agent TUIs emit absolute cursor positioning, so replaying
+   * their output into a differently-sized terminal wraps every line and
+   * scrolls without end.
+   */
+  cols?: number;
+  rows?: number;
 }
 
 /**
@@ -284,6 +293,8 @@ interface TerminalProcess {
   agentProbe?: AgentProbe;
   /** The agent showed its own working signal since it last went idle. */
   workedVisibly?: boolean;
+  /** Reason sent with the last `panel:agentStatus` event. */
+  lastStatusReason?: string | null;
   /** Last status scan, reused while the emulator pushes no new screen. */
   lastStatusScan?: { screen: ScreenState; detection: AgentDetectionResult };
   /** The CLI came up with typed initial input still to send; the status poll sends it. */
@@ -321,6 +332,18 @@ export interface TerminalForegroundProcess {
   /** The foreground is Pane's own interactive shell, not a program started from it. */
   isShell: boolean;
 }
+/**
+ * Whether a viewer's answer to a terminal query reached the PTY.
+ *
+ * Reported rather than swallowed so a renderer can be tested for having
+ * deferred to the designated viewer, not merely for having stayed silent.
+ */
+export interface TerminalReplyResult {
+  delivered: boolean;
+}
+
+const REPLY_DELIVERED: TerminalReplyResult = { delivered: true };
+const REPLY_DROPPED: TerminalReplyResult = { delivered: false };
 
 interface CliLaunchResolution {
   commandToRun: string;
@@ -934,7 +957,7 @@ export class TerminalPanelManager extends EventEmitter {
     // state machine (see `main/src/ptyHost/flowControl.ts`).
     flowControlOnPtyBytes(
       terminal.flowControl,
-      data.length,
+      Buffer.byteLength(data, 'utf8'),
       () => this.pausePty(terminal),
       () => this.resumePty(terminal),
     );
@@ -1001,9 +1024,69 @@ export class TerminalPanelManager extends EventEmitter {
     terminal.pty.resume();
   }
 
-  acknowledgeBytes(panelId: string, bytesConsumed: number): void {
+  /**
+   * The one viewer that speaks for this panel.
+   *
+   * Two jobs, one answer, because both break the same way when more than one
+   * viewer does them.
+   *
+   * Acknowledgement: `pendingBytes` is a single counter per PTY, so every
+   * viewer that writes the same broadcast chunk and acks it credits the counter
+   * again — two viewers drain it at twice the rate it was debited, the high
+   * watermark is never reached, and the PTY is never paused. Flow control only
+   * works with a single designated consumer.
+   *
+   * Answering terminal queries: an agent asks *the* terminal where the cursor
+   * is, and expects one reply. A second answer from a second renderer moves the
+   * agent's idea of where its screen starts, which is what made a Codex pane
+   * mispaint while a Mission Control tile watched it.
+   *
+   * A primary viewer (a real terminal panel, a remote runtime) is preferred
+   * because it is the one that must keep up. A preview viewer is designated
+   * only when it is the only viewer there is, because otherwise nobody would
+   * ack — and nobody would answer — and the agent would wait forever.
+   */
+  private designatedViewer(panelId: string): string | undefined {
+    const viewers = this.visibleViewersByPanel.get(panelId);
+    if (!viewers || viewers.size === 0) return undefined;
+
+    const ids = [...viewers.keys()].sort();
+    const primary = ids.find((id) => !this.visibilityViewerMatchesPrefix(id, MISSION_CONTROL_VIEWER_PREFIX));
+    return primary ?? ids[0];
+  }
+
+  /**
+   * Answer a terminal query on behalf of one viewer.
+   *
+   * The renderer that produced the reply does not get to decide whether it
+   * ships: it cannot see the other windows, tiles or remote runtimes watching
+   * the same PTY. Main can, so the designation is checked here and a reply from
+   * anyone else is dropped. `delivered` is reported back so a renderer can be
+   * tested for having deferred rather than for having stayed silent.
+   */
+  writeTerminalReply(panelId: string, data: string, viewerId?: string): TerminalReplyResult {
+    if (!this.terminals.has(panelId)) return REPLY_DROPPED;
+    const designated = this.designatedViewer(panelId);
+    if (!designated) return REPLY_DROPPED;
+    if (viewerId === undefined) return REPLY_DROPPED;
+    if (this.normalizeVisibilityViewerId(viewerId) !== designated) return REPLY_DROPPED;
+
+    this.writeToTerminal(panelId, data);
+    return REPLY_DELIVERED;
+  }
+
+  acknowledgeBytes(panelId: string, bytesConsumed: number, viewerId?: string): void {
     const terminal = this.terminals.get(panelId);
     if (!terminal) return;
+
+    // Only a Mission Control tile is ever refused, and only while another
+    // viewer is the designated consumer. Every other ack is credited as before:
+    // refusing a real panel or remote client risks stranding bytes it already
+    // received when the designation moves, which stalls the PTY.
+    if (viewerId && this.visibilityViewerMatchesPrefix(this.normalizeVisibilityViewerId(viewerId), MISSION_CONTROL_VIEWER_PREFIX)) {
+      const designated = this.designatedViewer(panelId);
+      if (designated && this.normalizeVisibilityViewerId(viewerId) !== designated) return;
+    }
 
     // Delegate to the shared flow-control helper. It decrements `pendingBytes`,
     // clears the safety timer, and invokes the resume callback only when the
@@ -1086,9 +1169,18 @@ export class TerminalPanelManager extends EventEmitter {
     }
   }
 
+  /**
+   * One spelling for a viewer id, whichever entry point it arrives through.
+   *
+   * Registration and acknowledgement have to agree exactly, because the ack
+   * path compares against the registered id. Scoping in only one of them meant
+   * a panel registered as `local:<uuid>` and acked as `<uuid>`, so every ack
+   * was dropped and the PTY jammed at the high watermark.
+   */
   private normalizeVisibilityViewerId(viewerId: string): string {
     const trimmed = viewerId.trim();
-    return trimmed.length > 0 ? trimmed : 'local:legacy';
+    if (trimmed.length === 0) return 'local:legacy';
+    return trimmed.includes(':') ? trimmed : `local:${trimmed}`;
   }
 
   private visibilityViewerMatchesPrefix(viewerId: string, prefix: string): boolean {
@@ -1760,11 +1852,14 @@ export class TerminalPanelManager extends EventEmitter {
         terminal.exitDuringDestroy ??= exitCode;
         return;
       }
+      let retired = false;
       try {
         this.retireTerminal(terminal, exitCode);
+        retired = true;
       } finally {
-        terminal.screenEmulator?.dispose();
+        if (!retired) terminal.screenEmulator?.dispose();
       }
+      void this.persistExitScreenText(terminal);
 
       // Notify frontend (include signal for crash detection)
       this.sendRendererEvent('terminal:exited', {
@@ -1829,6 +1924,18 @@ export class TerminalPanelManager extends EventEmitter {
     return this.terminals.get(panelId)?.bracketedPasteMode === true;
   }
   
+  /** Shows a line from Pane itself in the terminal without sending it to the shell. */
+  showNotice(panelId: string, text: string): void {
+    const terminal = this.terminals.get(panelId);
+    if (!terminal || terminal.destroying) return;
+    const data = `\r\n\x1b[36m[Pane]\x1b[0m ${text}\r\n`;
+    // Same three sinks as PTY output: the screen agents read, scrollback, and live viewers.
+    terminal.screenEmulator?.write(data);
+    this.addToScrollback(terminal, data);
+    terminal.outputBuffer += data;
+    this.flushOutputBuffer(terminal);
+  }
+
   writeToTerminal(panelId: string, data: string): void {
     const terminal = this.terminals.get(panelId);
     if (!terminal) {
@@ -1986,6 +2093,9 @@ export class TerminalPanelManager extends EventEmitter {
       cwd: cwd,
       scrollbackBuffer: savedScrollback,
       alternateScreenBuffer: terminal.alternateScreenBuffer,
+      // Survives dispose: the emulator keeps its last screen text, so a panel
+      // saved on exit still knows what the agent finished on.
+      screenText: restore?.screenText ?? terminal.screenEmulator?.state.screenText,
       isAlternateScreen: savedIsAlternateScreen,
       lastActivityTime: terminal.lastActivity.toISOString(),
       serializedBuffer: restore?.isAlternateScreen
@@ -2002,6 +2112,31 @@ export class TerminalPanelManager extends EventEmitter {
     
   }
   
+  /**
+   * Record the screen an exited terminal finished on, then dispose its
+   * emulator. A stopped panel's readers (Mission Control tiles, `runpane
+   * panels screen`) fall back to this persisted copy, so the emulator drains
+   * the last output before its screen is read.
+   */
+  private async persistExitScreenText(terminal: TerminalProcess): Promise<void> {
+    const emulator = terminal.screenEmulator;
+    try {
+      await emulator?.refresh();
+      const screenText = emulator?.state.screenText;
+      const panel = panelManager.getPanel(terminal.panelId);
+      // A replacement terminal may have started in this panel during the drain;
+      // its own state wins over this lifetime's last screen.
+      if (!screenText || !panel || this.terminals.has(terminal.panelId)) return;
+      const state = panel.state;
+      state.customState = { ...terminalCustomState(state), screenText };
+      await panelManager.updatePanel(panel.id, { state });
+    } catch (error) {
+      console.error(`[TerminalPanelManager] Failed to save exit screen for ${terminal.panelId}:`, error);
+    } finally {
+      emulator?.dispose();
+    }
+  }
+
   private async getProcessCwd(pid: number): Promise<string> {
     // This is platform-specific and simplified
     // In production, you'd use more robust methods
@@ -2107,6 +2242,8 @@ export class TerminalPanelManager extends EventEmitter {
       isCliReady: customState.isCliReady,
       agentType,
       agentSessionId: customState.agentSessionId ?? terminal.capturedAgentSessionId,
+      cols: terminal.pty?.cols,
+      rows: terminal.pty?.rows,
     };
   }
 
@@ -2173,6 +2310,7 @@ export class TerminalPanelManager extends EventEmitter {
   }
 
   private emitAgentStatus(terminal: TerminalProcess, state: AgentState, reason: string | null): void {
+    terminal.lastStatusReason = reason;
     const payload: PanelAgentStatusEvent = {
       panelId: terminal.panelId,
       sessionId: terminal.sessionId,
@@ -2233,6 +2371,13 @@ export class TerminalPanelManager extends EventEmitter {
         if (detection.visibleWorking) terminal.workedVisibly = true;
         const next = this.agentStatusMonitor.update(terminal.panelId, detection, Date.now());
         if (next) this.emitAgentStatus(terminal, next, detection.matchedRuleId);
+        // A new blocking screen (folder trust giving way to another prompt) keeps
+        // the state but carries a new reason, which the Session view reads.
+        else if (
+          detection.state === 'blocked'
+          && this.agentStatusMonitor.getState(terminal.panelId) === 'blocked'
+          && detection.matchedRuleId !== terminal.lastStatusReason
+        ) this.emitAgentStatus(terminal, 'blocked', detection.matchedRuleId);
         if (
           terminal.agentType === 'opencode'
           && detection.matchedRuleId === 'idle_composer'

@@ -11,7 +11,7 @@ import { panelManager } from '../services/panelManager';
 import { terminalPanelManager } from '../services/terminalPanelManager';
 import { getMobilePushSender } from '../daemon/mobilePushSender';
 import { databaseService } from '../services/database';
-import { CreatePanelRequest, PanelEventType, SessionPanelLayout, ToolPanel, type PanelLayoutNode } from '../../../shared/types/panels';
+import { CreatePanelRequest, PanelEventType, SessionPanelLayout, ToolPanel, decodeSessionPanelLayout } from '../../../shared/types/panels';
 import type { AppServices } from './types';
 import type { PanelAgentStatusEvent } from '../../../shared/types/agentStatus';
 import { PANE_CHAT_SESSION_ID } from '../../../shared/types/paneChat';
@@ -24,33 +24,6 @@ import { prepareRemoteBrowserFiles } from '../daemon/client/remoteBrowserFiles';
 import { ChunkedUploadStore, type UploadStart } from '../services/chunkedUploadStore';
 
 const execFileAsync = promisify(execFile);
-
-const panelLayoutNodeSchema: BoundarySchema<PanelLayoutNode> = {
-  decode(cursor) {
-    return boundary.union(
-      boundary.object({
-        type: boundary.literal('group'),
-        id: boundary.string,
-        panelIds: boundary.array(boundary.string),
-        activePanelId: boundary.nullable(boundary.string),
-      }),
-      boundary.object({
-        type: boundary.literal('split'),
-        id: boundary.string,
-        direction: boundary.enumeration('row', 'column'),
-        children: boundary.array(panelLayoutNodeSchema),
-        sizes: boundary.array(boundary.number),
-      }),
-    ).decode(cursor);
-  },
-};
-
-const sessionPanelLayoutSchema: BoundarySchema<SessionPanelLayout> = boundary.object({
-  version: boundary.literal(1),
-  root: panelLayoutNodeSchema,
-  focusedGroupId: boundary.optional(boundary.string),
-  zoomedGroupId: boundary.optional(boundary.nullable(boundary.string)),
-});
 
 /**
  * Check if a session's project is WSL-enabled and convert path if needed.
@@ -460,6 +433,7 @@ const DAEMON_PANEL_CHANNELS = [
   'panels:send-terminal-input',
   'panels:shouldAutoCreate',
   'terminal:input',
+  'terminal:reply',
   'terminal:resize',
   'terminal:getState',
   'terminal:saveState',
@@ -491,7 +465,8 @@ export function registerPanelHandlers(
   // Panel CRUD operations
   commandRegistry.register('panels:create', async (request: CreatePanelRequest) => {
     try {
-      const panel = await panelManager.createPanel(request);
+      // A client's own new tab moves no other client.
+      const panel = await panelManager.createPanel({ ...request, announceActivation: false });
       return { success: true, data: panel };
     } catch (error) {
       console.error('[IPC] Failed to create panel:', error);
@@ -501,8 +476,15 @@ export function registerPanelHandlers(
   
   commandRegistry.register('panels:delete', async (panelId: string) => {
     try {
-      // Clean up terminal process if it's a terminal panel
       const panel = panelManager.getPanel(panelId);
+      // Refuse before teardown. `deletePanel` declines permanent panels but
+      // returns quietly, so destroying the terminal first would kill the
+      // process, leave the panel in place, and still report success.
+      if (panel?.metadata.permanent) {
+        return { success: false, error: 'This panel cannot be closed.' };
+      }
+
+      // Clean up terminal process if it's a terminal panel
       if (panel?.type === 'terminal') {
         await terminalPanelManager.destroyTerminal(panelId, { saveState: false });
       }
@@ -569,7 +551,7 @@ export function registerPanelHandlers(
   
   commandRegistry.register('panels:set-active', async (sessionId: string, panelId: string) => {
     try {
-      await panelManager.setActivePanel(sessionId, panelId);
+      await panelManager.rememberActivePanel(sessionId, panelId);
       return { success: true };
     } catch (error) {
       console.error('[IPC] Failed to set active panel:', error);
@@ -587,13 +569,14 @@ export function registerPanelHandlers(
       const raw = databaseService.getSessionPanelLayout(sessionId);
       if (!raw) return { success: true, data: null };
       try {
-        const parsed = decodeBoundary(JSON.parse(raw), sessionPanelLayoutSchema);
-        return { success: true, data: parsed };
+        // The same decoder reads each desktop's own layout memory.
+        const parsed = decodeSessionPanelLayout(JSON.parse(raw));
+        if (parsed) return { success: true, data: parsed };
       } catch {
         // Malformed JSON should never brick a session
-        console.warn('[IPC] Corrupt panel_layout JSON for session', sessionId);
-        return { success: true, data: null };
       }
+      console.warn('[IPC] Corrupt panel_layout JSON for session', sessionId);
+      return { success: true, data: null };
     } catch (error) {
       console.error('[IPC] Failed to get panel layout:', error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -748,9 +731,16 @@ export function registerPanelHandlers(
   commandRegistry.register('terminal:input', async (panelId: string, data: string) => {
     // Desktop, phone and remote web all type through here, so it is always a person.
     getMobilePushSender(services.configManager).observeInput(panelId, data);
+    services.orchestrationSessionManager?.observeInput(panelId, data);
     return terminalPanelManager.writeToTerminal(panelId, data);
   });
   
+  // A reply to a query the agent asked its terminal, from a viewer that may not
+  // be the one allowed to answer. terminalPanelManager holds the designation.
+  commandRegistry.register('terminal:reply', async (panelId: string, data: string, viewerId?: string) => {
+    return terminalPanelManager.writeTerminalReply(panelId, data, viewerId);
+  });
+
   commandRegistry.register('terminal:resize', async (
     panelId: string,
     cols: number,
@@ -792,16 +782,13 @@ export function registerPanelHandlers(
   // output cadence can drop to OUTPUT_BATCH_INTERVAL_HIDDEN while hidden.
   // No-op when the panel's PTY isn't in the map (pre-init / post-destroy).
   commandRegistry.register('terminal:setVisibility', async (panelId: string, isVisible: boolean, viewerId?: string) => {
-    const scopedViewerId = viewerId?.includes(':')
-      ? viewerId
-      : viewerId
-        ? `local:${viewerId}`
-        : undefined;
-    terminalPanelManager.setVisibility(panelId, !!isVisible, scopedViewerId);
+    // Scoping lives in terminalPanelManager, so registration and ack cannot
+    // disagree about how a bare id is spelled.
+    terminalPanelManager.setVisibility(panelId, !!isVisible, viewerId);
   });
 
-  commandRegistry.register('terminal:ack', async (panelId: string, bytesConsumed: number) => {
-    terminalPanelManager.acknowledgeBytes(panelId, bytesConsumed);
+  commandRegistry.register('terminal:ack', async (panelId: string, bytesConsumed: number, viewerId?: string) => {
+    terminalPanelManager.acknowledgeBytes(panelId, bytesConsumed, viewerId);
   });
 
   // Reset flow control state (for recovering from stuck terminals)

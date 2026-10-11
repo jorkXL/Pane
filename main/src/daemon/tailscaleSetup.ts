@@ -191,6 +191,26 @@ export function readTailscaleServeHandlers(serveStatusJson: string): TailscaleSe
   };
 }
 
+const SERVE_BUSY_RETRIES = 4;
+
+/**
+ * Runs `tailscale serve <args>`. Serve accepts one writer at a time and refuses the others with
+ * "Another client is changing the serve config", so a refused change is retried after a pause.
+ */
+export async function runTailscaleServe(
+  run: RemoteSetupCommandRunner,
+  tailscale: ResolvedCommand,
+  args: string[],
+  timeoutMs?: number,
+): ReturnType<RemoteSetupCommandRunner> {
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await run(tailscale.command, ['serve', ...args], { env: tailscale.env, timeoutMs });
+    const busy = !result.ok && /another client is changing the serve config/iu.test(`${result.stderr}\n${result.stdout}`);
+    if (!busy || attempt === SERVE_BUSY_RETRIES) return result;
+    await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
+  }
+}
+
 export function isIpv4Address(value: string): boolean {
   const parts = value.split('.');
   return parts.length === 4 && parts.every((part) => {
@@ -221,8 +241,9 @@ export function installTailscaleCommandOrThrow(
 
 export function resolveTailscaleCommand(
   dependencies: TailscaleSetupDependencies = defaultTailscaleSetupDependencies,
+  pathExists: (candidate: string) => boolean = existsSync,
 ): ResolvedCommand | null {
-  return tailscaleCandidates().find(command => commandExistsWithArgs(command, ['version'], dependencies)) ?? null;
+  return tailscaleCandidates(pathExists).find(command => commandExistsWithArgs(command, ['version'], dependencies)) ?? null;
 }
 
 export async function resolveTailscaleCommandAsync(
@@ -430,6 +451,10 @@ export function getTailscaleServeSetupInstructions(port?: number): string {
 function tailscaleCandidates(pathExists: (candidate: string) => boolean = existsSync): ResolvedCommand[] {
   const commands: ResolvedCommand[] = [{ command: 'tailscale', displayCommand: 'tailscale' }];
   if (process.platform === 'darwin') {
+    // GUI and updater relaunches may omit Homebrew from PATH.
+    for (const candidate of ['/opt/homebrew/bin/tailscale', '/usr/local/bin/tailscale']) {
+      if (pathExists(candidate)) commands.push({ command: candidate, displayCommand: quoteForPosix(candidate) });
+    }
     for (const candidate of [
       '/Applications/Tailscale.app/Contents/MacOS/Tailscale',
       path.join(os.homedir(), 'Applications', 'Tailscale.app', 'Contents', 'MacOS', 'Tailscale'),
@@ -446,6 +471,21 @@ function tailscaleCandidates(pathExists: (candidate: string) => boolean = exists
       if (!directory) continue;
       const candidate = path.join(directory, 'Tailscale', 'tailscale.exe');
       if (pathExists(candidate)) commands.push({ command: candidate, displayCommand: quoteForWindows(candidate) });
+    }
+  }
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    // Snap and Nix installs sit outside the PATH a desktop launcher or relaunch may give Pane.
+    // XDG ignores a relative XDG_STATE_HOME; probing it would run a file from the working directory.
+    const xdgStateHome = process.env.XDG_STATE_HOME;
+    const stateHome = xdgStateHome && path.isAbsolute(xdgStateHome) ? xdgStateHome : path.join(os.homedir(), '.local', 'state');
+    for (const candidate of [
+      '/snap/bin/tailscale',
+      '/var/lib/snapd/snap/bin/tailscale',
+      '/run/current-system/sw/bin/tailscale',
+      path.join(os.homedir(), '.nix-profile', 'bin', 'tailscale'),
+      path.join(stateHome, 'nix', 'profile', 'bin', 'tailscale'),
+    ]) {
+      if (pathExists(candidate)) commands.push({ command: candidate, displayCommand: quoteForPosix(candidate) });
     }
   }
   return commands;

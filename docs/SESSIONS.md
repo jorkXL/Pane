@@ -6,11 +6,13 @@ optional overview keeps the Session name, associated Panes, and recent
 activity together while the chat remains the focused work surface. A tab
 shares its parent Pane's worktree.
 
-In the sidebar, `+` opens an agent picker and an optional chat name field. Pane
-remembers the chosen agent as the default for future Sessions while existing
-Sessions keep their own agent. A blank name receives a generated name such as
-`New chat` or `New chat 2`; each new Session opens as one Pane Chat and can be
-renamed later from the optional read-only overview. Expand a Session to see
+In the sidebar, `+` opens an agent picker, an optional Session name field, and
+an optional "What is this Session for?" field that becomes the Session's goal.
+Pane remembers the chosen agent as the default for future Sessions while
+existing Sessions keep their own agent. A blank name starts as `New chat` or
+`New chat 2` and is renamed once from the first message you send the Session
+agent; a name you type or set later is kept. Each new Session opens as one Pane
+Chat and can be renamed later from the optional read-only overview. Expand a Session to see
 its associated Panes and open any Pane in its existing sidebar view.
 
 The Sessions section below the divider can be collapsed from its header; the
@@ -135,21 +137,46 @@ automatically; use an explicit resume command if you know their ID.
 ## Session sidebar and archive
 
 Pinned is the first sidebar category and can contain both Session chats and
-Panes. Right-click a Session to pin or unpin it. The pin preference survives
-restarts; an archived Session stays out of Pinned until it is restored. RunPane
-can set the same preference with `sessions pin` or `sessions unpin --session
-<id|name>`. Create JSON accepts `isPinned` (default false), and update JSON
-accepts it without changing the preference when omitted.
+Panes. Right-click a Session, or use the ⋯ button that appears on hover, to pin or unpin it, or turn on **Start pinned** in
+Create Session to pin it from the start. The dialog remembers that toggle for
+the next Session (on the desktop in Pane's config, in the remote web app on
+that device). The pin preference survives restarts; an archived Session stays
+out of Pinned until it is restored. RunPane can set the same preference with
+`sessions pin` or `sessions unpin --session <id|name>`. Create JSON accepts
+`isPinned` (default false), and update JSON accepts it without changing the
+preference when omitted.
 
-Click a Session row to open its chat and expand or collapse its associated
-Panes. Child Pane rows are indented beyond the Session chat icon and keep the
-ordinary Pane actions. Single-line Pane rows omit change counts and PR numbers;
-the optional two-row layout shows those details below the title. Session and Pane
+Click a Session row to open its chat, or use **Switch to Session: <name>** in the
+command palette (`⌘⇧P` / `Ctrl+Shift+P`), which also has **New Session**. A Session with associated Panes shows a
+chevron that expands or collapses them; a Session without Panes shows none.
+Child Pane rows are indented beyond the Session chat icon and keep the ordinary
+Pane actions. Create Pane, opened while a Session is showing, has an
+**Add to <Session>** checkbox, on by default, that files the new Pane under that
+Session. A Pane that belongs to a Session names it in the window title bar as
+"<Session> › <Pane>"; click the Session name to go back to it. To file an
+existing Pane under a Session, right-click the Pane, choose
+**Add to Session**, then pick the Session. **Remove from <Session>** in the same
+menu takes it out again; the Pane and its worktree are unchanged. Pinned Pane
+rows show the Pane name with its repository muted beside it. Single-line Pane rows omit change counts and PR numbers; the
+optional two-row layout shows those details below the title. Session and Pane
 context menus use compact widths.
 
-The right sidebar has Overview, Files, and Changes tabs. Overview shows linked
-Panes and activity. Files browses the Session workspace. Changes summarizes
-linked worktrees and opens a Pane for detailed review. The upper-right sidebar
+The experimental **Attention inbox** (Settings > Advanced > Experimental) turns
+the Projects list into an Inbox of the Panes that need you: an agent waiting on
+input or approval, an agent that completed a real turn since Pane started (it
+worked on a prompt and went idle; a freshly started agent does not count), or a
+Pane that errored. Session child rows follow the same filter, and a Session row still
+counts all of its Panes. A row leaves when its agent works again; opening it
+does not remove it. Hover a row and choose **Dismiss** (check mark) to hide it
+until its agent works again. The row under the Inbox counts the hidden Panes
+("3 running · 1 idle") and **Show all** lists every Pane. Pinned rows are
+unchanged, and ⌘1–9 number the Inbox rows while it is shown.
+
+The right sidebar has Overview, Files, and Changes tabs. Overview shows the
+Session's blockers, goal, next step, and decisions when they are set, then its
+Panes and recent activity. Agent state changes stay out of Activity; the status
+dot shows them. Files browses the Session workspace. Changes summarizes the
+Session's Panes and opens a Pane for detailed review. The upper-right sidebar
 button shows or hides the selected tab. A single Session uses two rows at the
 top: the window title bar shows its name and controls, and the tab strip sits
 directly below it. Session file clicks open editor tabs beside the agent tab in
@@ -160,7 +187,9 @@ restores its tab.
 
 ![Two-row Session header in Walnut](screenshots/two-row-header-walnut.png)
 
-Right-click a Session to archive it. Archiving hides the chat from the active
+Right-click a Session, or use its ⋯ button, to archive it. An "Archived · Undo"
+toast offers to restore it for a few seconds, and archiving the open Session
+returns the desktop view to Home. Archiving hides the chat from the active
 Sessions list while retaining its identity, conversation history, and Pane
 associations. Its Panes and worktrees remain accessible through repository
 navigation. Restore the Session from the sidebar’s Archived section. This is
@@ -200,6 +229,41 @@ within its scope. An independent Pane works locally unless coordination is
 requested. Tool availability does not authorize unrelated work or automatic
 sharing of other conversations.
 
+## One Pane per feature
+
+**1 feature = 1 worktree = 1 branch = 1 Pane; reviews, audits, fixes and QA for it are tabs in that Pane.**
+
+A feature here means one branch and its PR. A new Pane creates a worktree that
+checks out the repository, installs dependencies and often builds, so it is
+expensive, and creating several at once can freeze the machine. An
+orchestrator creates a Pane with `runpane panes create` only when the work's
+branch has no Pane yet: new work, or an existing PR with no Pane.
+
+Pane enforces both: `panes create --branch` refuses a branch another Pane has
+checked out (code `ERR_RUNPANE_BRANCH_HAS_PANE`, naming that Pane), and at most
+2 Panes run setup at once while the rest wait in line.
+
+Every later agent for that feature runs inside its Pane as a new agent tab:
+implementer, reviewer, follow-up reviewer, auditor, fix implementer and QA. Each tab is a
+fresh agent with its own context, sharing the Pane's worktree and branch:
+
+```text
+runpane panels create --pane <feature-pane-id> --tool-command "<agent command>" --source agent --no-focus --wait-ready --yes --json
+```
+
+Before `runpane panes create`, find the work's Pane with
+`runpane panes list --repo <repo> --json`, matching the PR's head branch
+(`gh pr view <n> --json headRefName`) against
+`git -C <worktreePath> branch --show-current`, and use it when it exists.
+
+Tabs share one checkout. Only the implementer changes the branch or HEAD, one
+writer at a time, and a fix tab starts only after the previous writer has
+stopped. Review, audit and QA tabs never run `git checkout`, `reset` or
+`stash`. Never create a Pane to review, audit, fix or QA work that already has
+one. Keep the
+feature's Pane until its PR merges or closes, so later tabs still have the
+worktree; archive it then.
+
 ## Pane association before delegation
 
 Management is a Pane-level relationship; tabs inherit the relationship and
@@ -222,11 +286,24 @@ create`, check the item's `association.ok` right away. Keep a Pane attached thro
 completion. Archiving preserves the association.
 
 To close out finished work, `runpane panes archive --session <id|name> --merged
-[--remove-worktree] [--dry-run] --yes --json` archives every associated Pane
-whose work is clean and pushed, or whose branch was merged through a pull
-request whose head is the Pane's `HEAD`. Every other Pane is skipped with a
-reason (`skipped.code`). `--remove-worktree` also removes adopted worktrees;
-local branches are always kept. Run it with `--dry-run` first.
+[--remove-worktree] [--dry-run] --yes --json` archives each associated Pane
+when both hold:
+
+- **Its PR is merged.** Pane looks the PR up by the Pane's branch on GitHub
+  (`pr`). An open PR is skipped as `pr-open`, because its review, fix and QA
+  tabs still need the worktree. No PR or a PR closed without merging is
+  skipped as `pr-not-merged`, so a worker that has pushed but not opened its
+  PR keeps its Pane. A PR state GitHub can't confirm is skipped as
+  `pr-status-unknown`.
+- **Its worktree holds no unsaved work.** It has no uncommitted or untracked
+  changes, and every commit is on its upstream after a fresh `git fetch`, or,
+  without an upstream, on a remote-tracking branch or the base branch. A
+  failed fetch or unreadable worktree is skipped as `status-unknown`. This
+  check runs after the PR lookup, right before the worktree is removed.
+
+Every skipped Pane has a `skipped.code` and a message with the next step.
+`--remove-worktree` also removes adopted worktrees; local branches are always
+kept. Run it with `--dry-run` first.
 
 Before mutating, use `runpane agent-context --command 'sessions associate'
 --json` to confirm the wrapper supports the command. If an older global CLI
@@ -614,7 +691,9 @@ worktree defaults and existing historical pins are unchanged.
 ### Generated instructions and Git
 
 Session instructions and documents live under `<PANE_DIR>/sessions/<id>/`,
-outside the project. Session terminals set `GIT_CEILING_DIRECTORIES` to
+outside the project. While the Session agent shows its folder-trust prompt, a
+banner across the top of the chat says the folder is Pane's own, holding the
+Session's notes and no project code. Session terminals set `GIT_CEILING_DIRECTORIES` to
 `<PANE_DIR>/sessions`, so git run in a Session folder never picks up a repository
 above it, such as a home directory tracked as a dotfiles repo. Do not configure
 PANE_DIR inside a project repository.
